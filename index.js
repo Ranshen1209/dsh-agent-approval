@@ -56,9 +56,22 @@
 
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { Service } from "@deepseek-ai/cordis";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  EVIDENCE_LIMIT,
+  RECORD_ARGS_LIMIT,
+  errText,
+  evidenceText,
+  isBlanketAllow,
+  isTruncatedEvidence,
+  matchRules,
+  newRuleId,
+  ruleRegex,
+  shortId,
+  trunc,
+} from "./lib/pure.js";
 
 // ---- constants --------------------------------------------------------------
 
@@ -136,6 +149,7 @@ const APPROVER_PERSONA = [
   "You are an independent security approval agent inside a coding harness.",
   "Your only job is to judge ONE request for wider sandbox access and report the verdict through the structured_output tool.",
   "You reject what is concretely dangerous — destructive or irreversible operations, ones that reach outside their stated purpose, or requests whose stated justification does not match the actual arguments. Mere uncertainty, an unfamiliar command, or a terse justification is never enough: every rejection must name the concrete risk the operation creates.",
+  "Incomplete evidence is itself a concrete, sufficient reason to reject: if the exact arguments are missing or visibly cut short by an omission marker, you cannot see what would actually run, so you must reject rather than approve a partially shown operation.",
   "Your own judging session is deliberately sandboxed: approvals are disabled for YOU and your permission scope is fixed. That describes only your own environment — never cite your own constraints (or anything your runtime context says about YOUR permissions) as a property of the requesting session or as grounds for rejection.",
   "You never ask questions, never attempt the operation yourself, and never finish with a plain-text answer.",
 ].join(" ");
@@ -149,10 +163,10 @@ const APPROVER_PERSONA = [
  * context and run the registered initializers against the instance.
  *
  * @param {object} instance - live service instance whose prototype is marked.
- * @param {string} method - public instance method name.
- * @param {string} [exportName] - wire export name; defaults to the method name.
+ * @param {string} method - public instance method name, which is also the wire
+ *   export name (the two are identical for every method of this service).
  */
-function markRemoteMethod(instance, method, exportName) {
+function markRemoteMethod(instance, method) {
   const decorator = Remote(method, undefined);
   const initializers = [];
   decorator(undefined, {
@@ -165,34 +179,8 @@ function markRemoteMethod(instance, method, exportName) {
   for (const fn of initializers) fn.call(instance);
 }
 
-/** Truncate a long string for the audit record; pass through non-strings as "". */
-function trunc(value, n) {
-  if (typeof value !== "string") return "";
-  return value.length > n ? value.slice(0, n) + "…[truncated]" : value;
-}
-
-/**
- * First 8 chars of a session / run id (display form in records and chips).
- * DSH prefixes session ids with the literal `"session-"` before the UUID
- * (see `@deepseek-ai/dsh-host-apiproxy` `session create` and
- * `@deepseek-ai/dsh-headless` SessionId(`session-${randomUUID()}`)); a naive
- * `slice(0, 8)` lands on that meaningless 8-char prefix and every audit row
- * shows nothing but `"session-"`. Strip the known prefix before truncating
- * so the displayed fragment comes from the UUID proper (where the real
- * discriminator lives); id shapes without the prefix (subagent `run.id`
- * = raw `randomUUID()`) are unaffected.
- */
-const SESSION_ID_PREFIX = "session-";
-function shortId(id) {
-  const s = String(id);
-  const tail = s.startsWith(SESSION_ID_PREFIX) ? s.slice(SESSION_ID_PREFIX.length) : s;
-  return tail.slice(0, 8);
-}
-
-/** Best-effort error text. */
-function errText(e) {
-  return e && typeof e.message === "string" ? e.message : String(e);
-}
+// Pure decision helpers (rule matching, evidence rendering, id display, error
+// text) live in ./lib/pure.js so they stay unit-testable without the harness.
 
 // ---- service ----------------------------------------------------------------
 
@@ -203,11 +191,13 @@ export class AgentApprovalService extends TypertRemoteService {
    *   - approval    : the waterfall we claim + the policy setter
    *   - subagents   : the `spawn` provider backing the judge child
    *   - agents      : sessionId → live Agent lookup for the client toggle
-   *   - timer       : `ctx.timeout` for the judge race (fail-closed timeout)
+   * The judge race uses a plain `setTimeout` cleared in `finally` rather than
+   * `ctx.timeout()`: the timer plugin's promise cannot be cancelled, so racing
+   * it left an armed timer (up to MAX_TIMEOUT_MS) behind on every request.
    * Optional surfaces (`llm`, `agentDefaultModel`, `systemPrompt`, `commands`)
    * are read opportunistically / mounted via `ctx.inject([...])` below.
    */
-  static inject = ["approval", "subagents", "agents", "timer"];
+  static inject = ["approval", "subagents", "agents"];
 
   /**
    * Cordis instantiates class plugins with `new Callback(ctx, config)` — the
@@ -223,14 +213,14 @@ export class AgentApprovalService extends TypertRemoteService {
    * service is published. Mark the Remote methods, then arm the claimer.
    */
   async [Service.init]() {
-    markRemoteMethod(this, "getState", "getState");
-    markRemoteMethod(this, "setModel", "setModel");
-    markRemoteMethod(this, "setApprovalTimeout", "setApprovalTimeout");
-    markRemoteMethod(this, "toggle", "toggle");
-    markRemoteMethod(this, "addRule", "addRule");
-    markRemoteMethod(this, "removeRule", "removeRule");
-    markRemoteMethod(this, "sessionRecords", "sessionRecords");
-    markRemoteMethod(this, "directory", "directory");
+    markRemoteMethod(this, "getState");
+    markRemoteMethod(this, "setModel");
+    markRemoteMethod(this, "setApprovalTimeout");
+    markRemoteMethod(this, "toggle");
+    markRemoteMethod(this, "addRule");
+    markRemoteMethod(this, "removeRule");
+    markRemoteMethod(this, "sessionRecords");
+    markRemoteMethod(this, "directory");
 
     /** Judge model override; empty strings = use the harness default route. */
     this._model = { provider: "", model: "" };
@@ -251,6 +241,12 @@ export class AgentApprovalService extends TypertRemoteService {
      * merely-similar arguments. Dropped with the session's enable entry.
      */
     this._trusted = new Map();
+    /**
+     * One-shot warning ledger: conditions that must be visible but must never
+     * spam the host log (the audit tab polls every 10s, so a per-read warning
+     * would be a flood). Keyed by the warning text.
+     */
+    this._warned = new Set();
 
     // Claim escalations BEFORE the interactive answerer. The host apiproxy
     // answerer registered earlier (composition load order); `{ prepend: true }`
@@ -288,13 +284,23 @@ export class AgentApprovalService extends TypertRemoteService {
     // Re-arm on (re)publication: a session whose durable log folds to the
     // agent-approval preset — resumed after a restart, or freshly created
     // with it as the default — gets its judging mode back. This is what makes
-    // the mode survive restarts. Subagent children never carry the preset
-    // event (delegation seeds only sandbox/approval), so they stay out.
+    // the mode survive restarts.
+    //
+    // DELEGATED CHILDREN ARE EXCLUDED. `dsh-subagent` pins every child's
+    // approval policy to `never` at delegation (captureDelegatedPolicyOverrides)
+    // precisely so a child cannot obtain access its parent did not grant. A
+    // FORK child, however, is seeded with the parent's log — including the
+    // parent's `permission/preset: agent-approval` event — so folding the log
+    // alone would re-arm the mode here and _enableCore would flip the child
+    // back to `ask`, silently undoing that pin. An explicit user selection for
+    // a live child session still works (the session/event path above is left
+    // untouched); only the automatic re-arm is skipped.
     this.ctx.on("agent/created", (payload) => {
       try {
         const agent = payload && payload.agent;
         if (!agent || !agent.session) return;
         if (this._enabled.has(agent.session.id)) return;
+        if (this._isDelegatedChild(agent.session)) return;
         if (this._lastKnob(agent.session, "permission/preset", "preset") !== PRESET_NAME) return;
         this._enableCore(agent.session, agent);
       } catch (e) {
@@ -387,6 +393,55 @@ export class AgentApprovalService extends TypertRemoteService {
       if (e.type === type) return e.data[field];
     }
     return undefined;
+  }
+
+  /**
+   * Whether this session was created as a delegated subagent child. DSH marks
+   * that on the durable header (`origin: "subagent"` for any spawn/fork child,
+   * `parentSession` for fork lineage). Used to keep the automatic re-arm from
+   * overriding the delegation's `never` approval pin — see `agent/created`.
+   *
+   * A header read failure returns false (preserve the ordinary re-arm) rather
+   * than true: silently dropping the mode for a healthy session is the exact
+   * failure class this plugin has been burned by before.
+   *
+   * @param session - the session to classify.
+   * @returns whether the session is a delegated child.
+   */
+  _isDelegatedChild(session) {
+    try {
+      const header = session ? session.header : undefined;
+      if (header === undefined || header === null) return false;
+      return header.origin === "subagent" || header.parentSession !== undefined;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Emit one warning through the host logger, at most once per process per
+   * message. Used for degradations that must be visible but must not spam (the
+   * audit tab polls every 10s, so a per-call warning would be a flood).
+   */
+  _warnOnce(message) {
+    try {
+      if (this._warned.has(message)) return;
+      this._warned.add(message);
+      let logger;
+      try {
+        logger = this.ctx.logger;
+        if (typeof logger === "function") logger = logger.call(this.ctx, "agent-approval");
+      } catch (e) {
+        logger = undefined;
+      }
+      if (logger && typeof logger.warn === "function") {
+        logger.warn(message);
+        return;
+      }
+      console.warn("[dsh-agent-approval] " + message);
+    } catch (e) {
+      /* a warning must never affect the approval flow */
+    }
   }
 
   /**
@@ -536,50 +591,8 @@ export class AgentApprovalService extends TypertRemoteService {
   }
 
   // ---- deterministic rules + session trust ----------------------------------
-
-  /**
-   * Compile a rule's `match`: "" matches every call of the tool;
-   * "/pattern/flags" is a regex; anything else is a plain substring tested
-   * against the raw arguments JSON. Returns undefined for the substring form,
-   * null for an invalid regex (rejected at add time; a corrupt persisted rule
-   * simply never matches).
-   */
-  _ruleRegex(match) {
-    if (match.length < 2 || match[0] !== "/") return undefined;
-    const last = match.lastIndexOf("/");
-    if (last <= 0) return undefined;
-    try {
-      return new RegExp(match.slice(1, last), match.slice(last + 1));
-    } catch (e) {
-      return null;
-    }
-  }
-
-  /** Whether one rule hits this exact call. */
-  _ruleMatches(rule, toolName, argsRaw) {
-    if (rule.tool !== "*" && rule.tool !== toolName) return false;
-    if (rule.match === "") return true;
-    const args = typeof argsRaw === "string" ? argsRaw : "";
-    const re = this._ruleRegex(rule.match);
-    if (re === null) return false;
-    if (re !== undefined) return re.test(args);
-    return args.indexOf(rule.match) !== -1;
-  }
-
-  /**
-   * First hitting rule — every deny rule is evaluated before any allow rule
-   * may win, so a later-added deny always overrides an earlier allow.
-   * Undefined when nothing hits.
-   */
-  _matchRules(toolName, argsRaw) {
-    let allowHit;
-    for (const rule of this._rules) {
-      if (!this._ruleMatches(rule, toolName, argsRaw)) continue;
-      if (rule.effect === "deny") return rule;
-      if (allowHit === undefined) allowHit = rule;
-    }
-    return allowHit;
-  }
+  // The matching primitives (`ruleRegex` / `ruleMatches` / `matchRules` /
+  // `isBlanketAllow`) are pure and live in ./lib/pure.js.
 
   /** Owned plain copies for the wire (strict result schema). */
   _rulesSnapshot() {
@@ -602,29 +615,37 @@ export class AgentApprovalService extends TypertRemoteService {
    * every line to keep the file self-describing.
    */
   _recordShape(sessionId, entry) {
+    const text = (value) => (value === undefined || value === null ? "" : String(value));
     return {
-      at: String(entry.at),
-      sessionId: String(sessionId),
-      toolName: String(entry.toolName),
-      reason: String(entry.reason),
-      args: String(entry.args),
+      at: text(entry.at),
+      sessionId: text(sessionId),
+      toolName: text(entry.toolName),
+      reason: text(entry.reason),
+      args: text(entry.args),
       outcome: entry.outcome,
-      riskLevel: String(entry.riskLevel),
-      model: String(entry.model),
+      riskLevel: text(entry.riskLevel),
+      model: text(entry.model),
       durationMs: Number(entry.durationMs) || 0,
-      childSessionId: String(entry.childSessionId),
-      rationale: String(entry.rationale),
+      childSessionId: text(entry.childSessionId),
+      rationale: text(entry.rationale),
     };
   }
 
   /**
    * Resolve the audit sidecar for one session: `agent-approval.jsonl` inside
    * the session's persistence directory (same directory as the session's own
-   * durable log, via `sessionPersistence.locate(header)` — a pure path
-   * resolution that also works for live sessions). Falls back to a
-   * plugin-owned per-session file under DSH_HOME when the seam or the
-   * location is unavailable; the fallback keeps restart-safety at the cost
-   * of not being cleaned up when the session is deleted.
+   * durable log).
+   *
+   * FRAGILITY, documented on purpose: the directory comes from
+   * `sessionPersistence.locate(header)`, which is NOT part of the public
+   * `SessionPersistence` contract — the public surface is only
+   * `create/open/flush/stat/list`, and `stat()` returns a snapshot WITHOUT any
+   * path. `locate` exists solely as a private method on the JSONL backend (its
+   * `private` marker is erased at runtime, which is why this works today), so a
+   * future DSH release may rename or drop it. When it is unavailable we fall
+   * back to a plugin-owned per-session file under DSH_HOME: restart-safe, but
+   * NOT deleted with the session — which is why the fallback is reported
+   * through the host logger instead of degrading silently.
    */
   async _recordsFileOf(session) {
     const persistence = this.ctx.get("sessionPersistence");
@@ -638,7 +659,13 @@ export class AgentApprovalService extends TypertRemoteService {
         /* fall through to the plugin-owned fallback */
       }
     }
-    return join(DATA_DIR, "records", `${String(session.id)}.jsonl`);
+    const fallback = join(DATA_DIR, "records", `${String(session.id)}.jsonl`);
+    this._warnOnce(
+      "sessionPersistence.locate() is unavailable, so approval audit records are being kept in " +
+        dirname(fallback) +
+        " instead of each session's own storage directory. They survive restarts but are NOT removed when a session is deleted. Please report this to the plugin author (the hook it relies on is not part of the public DSH API).",
+    );
+    return fallback;
   }
 
   /**
@@ -689,15 +716,23 @@ export class AgentApprovalService extends TypertRemoteService {
     return out;
   }
 
-  /** Persist the judge settings (model override + timeout + rules) to config.json. */
+  /**
+   * Persist the judge settings (model override + timeout + rules) to
+   * config.json. Written to a sibling temp file and renamed over the target:
+   * a crash mid-write would otherwise leave a truncated JSON file behind, and
+   * `_loadPersisted` treats unreadable config as "no config" — i.e. the user's
+   * whole rule table would vanish without a word. Best-effort: never throws.
+   */
   _persistConfig() {
     const body = JSON.stringify({
       model: { provider: this._model.provider, model: this._model.model },
       timeoutMs: this._timeoutMs,
       rules: this._rules,
     });
+    const tmp = CONFIG_FILE + ".tmp";
     mkdir(DATA_DIR, { recursive: true })
-      .then(() => writeFile(CONFIG_FILE, body, "utf8"))
+      .then(() => writeFile(tmp, body, "utf8"))
+      .then(() => rename(tmp, CONFIG_FILE))
       .catch(() => {
         /* best-effort */
       });
@@ -705,8 +740,8 @@ export class AgentApprovalService extends TypertRemoteService {
 
   /**
    * Load persisted judge settings at startup (audit records need no loading —
-   * they live in the session logs and are folded per session on demand).
-   * Corrupt config is skipped; never throws.
+   * they live in each session's sidecar and are read on demand). Corrupt config
+   * is skipped; never throws.
    */
   async _loadPersisted() {
     try {
@@ -729,11 +764,10 @@ export class AgentApprovalService extends TypertRemoteService {
             if (raw.effect !== "allow" && raw.effect !== "deny") continue;
             if (typeof raw.tool !== "string" || raw.tool === "") continue;
             if (typeof raw.match !== "string") continue;
+            // A hand-edited blanket allow rule IS loaded (dropping a user's
+            // rule silently would be worse); `addRule` no longer creates one.
             rules.push({
-              id:
-                typeof raw.id === "string" && raw.id !== ""
-                  ? raw.id
-                  : Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+              id: typeof raw.id === "string" && raw.id !== "" ? raw.id : newRuleId(),
               effect: raw.effect,
               tool: raw.tool,
               match: raw.match,
@@ -820,17 +854,33 @@ export class AgentApprovalService extends TypertRemoteService {
     if (task.recent.length > 0) {
       lines.push("Most recent user message(s), oldest first:\n" + task.recent.join("\n---\n"));
     }
+    const evidence = evidenceText(argsRaw, EVIDENCE_LIMIT);
     lines.push(
       "Tool requesting approval: " + String(req.toolName),
       "Stated reason: " + (typeof req.reason === "string" && req.reason !== "" ? req.reason : "(none)"),
-      "Exact tool arguments (raw JSON, possibly truncated):",
-      argsRaw === undefined ? "(not available)" : trunc(argsRaw, 4000) || "(empty)",
+      "Exact tool arguments (raw JSON; the head AND tail are kept, any omitted middle is marked):",
+      // `evidenceText` keeps both ends: a prefix-only cut would let the
+      // requester (which controls its own arguments) pad a harmless head until
+      // the destructive tail falls outside what the judge can see.
+      evidence === undefined ? "(not available)" : evidence === "" ? "(empty)" : evidence,
+    );
+    if (evidence === undefined) {
+      lines.push(
+        "NOTE: the exact arguments could NOT be recovered from the session log — the evidence is incomplete.",
+      );
+    } else if (isTruncatedEvidence(evidence)) {
+      lines.push(
+        "NOTE: the arguments above are cut — the omitted middle is not shown to you. The evidence is incomplete.",
+      );
+    }
+    lines.push(
       "",
       "APPROVE only if ALL of the following hold:",
       "- the operation is plausibly safe, non-destructive, and reversible;",
       "- it stays within, or is clearly required by, the user's task above;",
       "- the stated reason honestly matches the actual arguments;",
-      "- granting it once cannot leak secrets or cause irreversible system changes.",
+      "- granting it once cannot leak secrets or cause irreversible system changes;",
+      "- the exact arguments are FULLY visible — not missing and not cut by an omission marker.",
       "Judge the operation ITSELF against the user's task and the exact arguments — the stated reason is only supporting evidence: a terse or clumsy reason is NOT grounds for rejection when the operation is plainly safe and consistent with the task, and a well-phrased reason cannot save an operation that is destructive, out of scope, or dishonest about what it does.",
       "Judge the ACTUAL operation, not the escalation level's name: the harness offers only coarse escalation levels (workspace-write vs danger-full-access), so a narrow, task-required operation is acceptable even when it must ride on the broad level.",
       "Development-workflow operations count as task-scoped when they match the task and the arguments:",
@@ -838,8 +888,9 @@ export class AgentApprovalService extends TypertRemoteService {
       "- overwriting files that this same project previously installed there and can regenerate from source (reversible in practice, not an irreversible system change);",
       "- reading tool-owned config or logs needed to debug the task at hand.",
       "REJECT when the operation is destructive (mass deletion, disk formatting, registry/service/system-wide changes), exfiltrates credentials or secrets, touches resources unrelated to the task, modifies the operating system or OTHER applications' data, hides intent behind encoded or obfuscated content, or the reason does not match the arguments.",
+      "REJECT when the argument evidence is INCOMPLETE: if the exact arguments say \"(not available)\", are empty where an operation was clearly requested, or contain a \"chars omitted\" marker, you cannot see what would actually run. Rejecting for incomplete evidence is always allowed and never counts as vague unease — say so in the rationale and tell the requester to retry with a shorter, self-contained operation.",
       "Your own judging session is deliberately sandboxed: approvals are disabled for YOU and your permission scope is fixed by design. Anything your own runtime context says about YOUR permissions describes only you — it says nothing about the requesting session, and must never be cited as a property of that session or as grounds for rejection.",
-      "REJECT only when you can name a concrete, credible risk THIS specific operation creates — what it would destroy, leak, or change beyond the user's task. Vague unease, an unfamiliar command, or a terse stated reason is NOT a concrete risk: when no concrete risk exists and the operation fits the task, APPROVE. Report the verdict via the structured_output tool only.",
+      "REJECT only when you can name a concrete, credible risk THIS specific operation creates — what it would destroy, leak, or change beyond the user's task — or when the evidence above is incomplete. Vague unease, an unfamiliar command, or a terse stated reason is NOT a concrete risk: when no concrete risk exists, the evidence is complete, and the operation fits the task, APPROVE. Report the verdict via the structured_output tool only.",
     );
     return lines.join("\n");
   }
@@ -925,14 +976,17 @@ export class AgentApprovalService extends TypertRemoteService {
       at: startedAt,
       toolName: toolName,
       reason: trunc(req.reason, 300),
-      args: trunc(argsRaw, 2000),
+      // Head+tail rather than a prefix cut: the audit must show the part of a
+      // long command that actually does the damage (see `evidenceText`).
+      args: evidenceText(argsRaw, RECORD_ARGS_LIMIT) || "",
       durationMs: 0,
       childSessionId: "",
     };
 
     // 1. Deterministic rules run BEFORE the model — zero latency, zero cost.
-    //    Deny beats allow (see _matchRules); both are recorded for audit.
-    const rule = this._matchRules(toolName, argsRaw);
+    //    Deny beats allow (see `matchRules` in ./lib/pure.js); both are
+    //    recorded for audit.
+    const rule = matchRules(this._rules, toolName, argsRaw);
     if (rule !== undefined) {
       const text =
         (rule.effect === "deny" ? "matched deny rule" : "matched allow rule") +
@@ -981,24 +1035,45 @@ export class AgentApprovalService extends TypertRemoteService {
     base.childSessionId = shortId(run.id);
 
     let winner;
+    let timeoutHandle;
+    let onAbort;
+    const sig = req.signal;
     try {
       const abortRace = new Promise((resolve) => {
-        const sig = req.signal;
         if (sig.aborted) {
-          resolve("aborted");
+          resolve({ kind: "aborted" });
           return;
         }
-        sig.addEventListener("abort", () => resolve("aborted"), { once: true });
+        onAbort = () => resolve({ kind: "aborted" });
+        sig.addEventListener("abort", onAbort, { once: true });
+      });
+      // A plain timer, cleared in `finally`. `ctx.timeout()` looks tidier but
+      // its promise cannot be cancelled: racing it left an armed timer (up to
+      // MAX_TIMEOUT_MS) plus an unhandled rejection path on every request whose
+      // verdict arrived first.
+      const timeoutRace = new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => resolve({ kind: "timeout" }), this._timeoutMs);
       });
       winner = await Promise.race([
         run.result.then(
           (r) => ({ kind: "result", result: r }),
           (error) => ({ kind: "fault", error }),
         ),
-        abortRace.then((v) => ({ kind: v })),
-        this.ctx.timeout(this._timeoutMs).then(() => ({ kind: "timeout" })),
+        abortRace,
+        timeoutRace,
       ]);
     } finally {
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+      if (onAbort !== undefined) {
+        try {
+          sig.removeEventListener("abort", onAbort);
+        } catch (e) {
+          /* signal already torn down */
+        }
+      }
+      // Fire-and-forget: disposal must not delay a fail-closed verdict. The
+      // child is cancellation-safe; if this is skipped the child would live
+      // until its parent agent unwinds.
       run.dispose().catch(() => {});
     }
     base.durationMs = Date.now() - t0;
@@ -1151,6 +1226,13 @@ export class AgentApprovalService extends TypertRemoteService {
    * name or "*" for every tool; `match` is "" (every call of that tool), a
    * plain substring, or "/pattern/flags" tested against the raw arguments
    * JSON. Returns the full table.
+   *
+   * A blanket ALLOW rule (`tool: "*"` with an empty `match`) is refused: it
+   * would short-circuit every escalation of every tool before the model runs,
+   * i.e. switch the whole approval control off — from the settings page, with
+   * no confirmation, and with no trace. Blanket DENY rules stay allowed (a
+   * lockdown is a legitimate use of the same shape), and a hand-edited
+   * config.json is still honoured on load.
    */
   async addRule(request) {
     const effect = request && request.effect === "deny" ? "deny" : "allow";
@@ -1160,11 +1242,27 @@ export class AgentApprovalService extends TypertRemoteService {
     if (tool === "") {
       return { ok: false, error: { code: "invalid-rule", message: 'tool is required ("*" matches every tool)' } };
     }
-    if (this._ruleRegex(match) === null) {
-      return { ok: false, error: { code: "invalid-rule", message: "invalid /regex/flags match expression" } };
+    if (isBlanketAllow(effect, tool, match)) {
+      return {
+        ok: false,
+        error: {
+          code: "invalid-rule",
+          message:
+            'a blanket allow rule (tool "*" with an empty match) would disable agent approval for every operation; name a concrete tool, or give match a substring or /pattern/flags',
+        },
+      };
+    }
+    if (ruleRegex(match) === null) {
+      return {
+        ok: false,
+        error: {
+          code: "invalid-rule",
+          message: "invalid /regex/flags match expression (close the pattern with / and use only legal regex flags)",
+        },
+      };
     }
     this._rules.push({
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+      id: newRuleId(),
       effect: effect,
       tool: tool,
       match: match,

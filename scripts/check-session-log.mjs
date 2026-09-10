@@ -6,8 +6,15 @@
 // v1 note: an earlier revision of this script split frames with a naive
 // magic-scan and a placeholder bug, decoding only a subset of frames — it
 // reported "no agent-approval/record events" for a log that contained three.
-// This revision mirrors the harness's structural frame walk
+// The frame walk below mirrors the harness's structural
 // (dsh-session-persistence-jsonl scanZstdFrames) so every frame is decoded.
+//
+// Vocabulary note: the event set is version-specific, and a stale copy makes
+// the checker LIE — a type the installed harness knows gets reported as
+// "would refuse to load", and a type it does not know gets reported as fine.
+// The checker therefore prefers the INSTALLED harness's own export and only
+// falls back to the snapshot below (verified against DSH 0.1.3-alpha.2) when
+// `@deepseek-ai/dsh-session` is not resolvable from here.
 //
 // Usage: node scripts/check-session-log.mjs <session.jsonl.zstd> [...more]
 // Library use: import { auditLog } from this module.
@@ -16,21 +23,44 @@ import { zstdDecompressSync } from "node:zlib";
 import { pathToFileURL } from "node:url";
 
 const MAGIC = 0xfd2fb528;
-const KNOWN_SESSION_EVENT_TYPES = new Set([
+
+/** Snapshot of `KNOWN_SESSION_EVENT_TYPES` for DSH 0.1.3-alpha.2. */
+const FALLBACK_SESSION_EVENT_TYPES = [
   "agent-preset/selected", "agent/inbox/spliced", "approval/asked", "approval/decided",
-  "approval/policy", "assistant/chunk", "assistant/message", "command/done", "command/run",
+  "approval/policy", "assistant/attempt", "assistant/message", "command/done", "command/run",
   "compaction/end", "compaction/prune", "compaction/start", "compaction/summary",
-  "feedback/record", "goal/change", "hook/invoked", "hook/result", "llm/retry",
-  "llm/retry-started", "model/selection", "permission/preset", "plan/mode",
-  "request/context", "request/header", "sandbox/mode", "schedule/change",
-  "session-log-deepseek/delivery-accepted", "session/end-seed", "session/title",
-  "session/title-llm-request", "step/end", "step/start", "subagent/descriptor",
-  "subagent/model-selection-policy", "team/member", "team/message/delivered",
-  "team/message/queued", "team/task", "todo/write", "tool-workflow/agent-end",
-  "tool-workflow/agent-start", "tool-workflow/run-end", "tool-workflow/run-start",
-  "tool/call", "tool/code-dispatch", "tool/code-dispatch-start", "tool/result",
-  "turn/end", "turn/start", "user/message", "web/deepseek-search-llm-request",
-]);
+  "feedback/message-delete", "feedback/message-put", "feedback/record", "goal/change",
+  "hook/invoked", "hook/result", "llm/retry", "llm/retry-started", "model/selection",
+  "permission/preset", "plan/mode", "request/context", "request/header", "sandbox/mode",
+  "schedule/change", "session-log-deepseek/delivery-accepted", "session/end-seed",
+  "session/title", "session/title-llm-request", "step/end", "step/start",
+  "subagent/descriptor", "subagent/model-selection-policy", "team/member",
+  "team/message/delivered", "team/message/queued", "team/task", "todo/write",
+  "tool-workflow/agent-end", "tool-workflow/agent-start", "tool-workflow/run-end",
+  "tool-workflow/run-start", "tool/call", "tool/code-dispatch",
+  "tool/code-dispatch-start", "tool/result", "turn/end", "turn/start", "user/message",
+  "web/deepseek-search-llm-request",
+];
+
+/** Where the active vocabulary came from (reported by the CLI for honesty). */
+export let eventTypeSource = "bundled snapshot (DSH 0.1.3-alpha.2)";
+const KNOWN_SESSION_EVENT_TYPES = new Set(FALLBACK_SESSION_EVENT_TYPES);
+
+for (const specifier of ["@deepseek-ai/dsh-session", "@deepseek-ai/dsh-session/types"]) {
+  try {
+    const mod = await import(specifier);
+    const found = mod.KNOWN_SESSION_EVENT_TYPES;
+    const asSet = found instanceof Set ? found : Array.isArray(found) ? new Set(found) : undefined;
+    if (asSet !== undefined && asSet.size > 0) {
+      KNOWN_SESSION_EVENT_TYPES.clear();
+      for (const type of asSet) KNOWN_SESSION_EVENT_TYPES.add(type);
+      eventTypeSource = "installed " + specifier;
+      break;
+    }
+  } catch (e) {
+    /* not resolvable from this script's location — keep the snapshot */
+  }
+}
 
 /** Structural frame walk — mirrors scanZstdFrames (block headers, not magic scan). */
 function scanFrames(buf) {
@@ -106,11 +136,26 @@ export function auditLog(path) {
   return { frames: frames.length, tornStart, lines: lines.length, records, offenders, unknownMarked };
 }
 
-if (import.meta.url !== pathToFileURL(process.argv[1] ?? "").href) {
+/** Whether this module is the process entry point (never throws). */
+function isMain() {
+  try {
+    const entry = process.argv[1];
+    return typeof entry === "string" && entry !== "" && import.meta.url === pathToFileURL(entry).href;
+  } catch (e) {
+    return false;
+  }
+}
+
+if (!isMain()) {
   // imported as a library — no CLI side effects
 } else {
   let exitCode = 0;
+  let announced = false;
   for (const path of process.argv.slice(2)) {
+    if (!announced) {
+      announced = true;
+      console.log(`event-type vocabulary: ${eventTypeSource}`);
+    }
     try {
       const a = auditLog(path);
       const torn = a.tornStart !== undefined ? `, torn final frame at byte ${a.tornStart}` : "";

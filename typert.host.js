@@ -378,7 +378,7 @@ export const TYPERT = {
     services: [
       {
         description:
-          "Agent-approval permission mode service: pins enabled sessions to a workspace-write base, judges every sandbox escalation with an independent approval subagent (fail closed), appends the audit trail to each session's own log, and exposes model config to the DeepSeek Harness web UI.",
+          "Agent-approval permission mode service: pins enabled sessions to a workspace-write base, judges every sandbox escalation with an independent approval subagent (fail closed), appends the audit trail to a sidecar file inside each session's own storage directory, and exposes model config to the DeepSeek Harness web UI.",
         summary: "Agent-approval permission mode service.",
         tags: [],
         jsDoc:
@@ -398,7 +398,7 @@ export const TYPERT = {
             kind: "method",
             name: "setModel",
             signature: "@Remote('setModel') async setModel(request: AgentApprovalSetModelRequest): Promise<AgentApprovalSetModelResult>",
-            summary: "Set the judge model route (empty strings = inherit the requesting session's).",
+            summary: "Set the judge model route (empty strings = use the harness default route).",
             jsDoc:
               "/**\n * Set provider/model used by the approval subagent; empty strings clear the override.\n * @param request - { provider, model }.\n * @returns the stored route.\n */",
           },
@@ -424,7 +424,7 @@ export const TYPERT = {
             signature: "@Remote('addRule') async addRule(request: AgentApprovalAddRuleRequest): Promise<AgentApprovalRulesResult>",
             summary: "Add a deterministic allow/deny rule judged before the model (persisted).",
             jsDoc:
-              "/**\n * Add one rule: tool = exact name or \"*\"; match = \"\" (every call), substring, or /regex/flags over the raw arguments JSON. Deny is evaluated before allow.\n * @param request - { effect, tool, match, note }.\n * @returns the full rule table.\n */",
+              "/**\n * Add one rule: tool = exact name or \"*\"; match = \"\" (every call of that tool), a substring, or /pattern/flags over the raw arguments JSON. Deny is evaluated before allow. A blanket allow rule (tool \"*\" with an empty match) is refused.\n * @param request - { effect, tool, match, note }.\n * @returns the full rule table.\n */",
           },
           {
             kind: "method",
@@ -438,9 +438,9 @@ export const TYPERT = {
             kind: "method",
             name: "sessionRecords",
             signature: "@Remote('sessionRecords') async sessionRecords(request: AgentApprovalSessionRecordsRequest): Promise<AgentApprovalSessionRecordsResult>",
-            summary: "Fold one live session's audit records out of its own durable log.",
+            summary: "Read one live session's audit records out of its own storage directory.",
             jsDoc:
-              "/**\n * Fold the agent-approval/record events of one live session (chronological) plus the current enabled state. Records follow the session: persisted in its log, restored with it, gone when it is deleted.\n * @param request - { sessionId }.\n * @returns the session's records, or session-not-live.\n */",
+              "/**\n * Read the agent-approval sidecar of one live session (chronological), plus the current enabled state. The sidecar lives inside the session's own storage directory, so records follow the session: kept across restarts, gone when the session is deleted. The durable event log is never read for these records.\n * @param request - { sessionId }.\n * @returns the session's records, or session-not-live.\n */",
           },
           {
             kind: "method",

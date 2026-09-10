@@ -24,8 +24,9 @@
 | 🤖 新权限模式 | 开启后：沙箱基线固定 `workspace-write`，审批策略切到 `ask`（内部接管），**不再弹人工审批** |
 | 🤖 独立审批 Agent | 每次提权请求由一次性 `spawn` 子代理裁决：独立会话、零工具、只读材料，结构化输出 `{decision, riskLevel, rationale}` |
 | ⛔ 风险即拒绝 | 破坏性 / 不可逆 / 越界（含修改操作系统或其他应用数据）/ 理由与实际命令不符 → 直接 `reject`；仅"安全、可逆、与任务相符、理由诚实"才 `approve`——项目自身的安装/部署脚本写其文档指定路径属任务所需 |
-| 🔒 Fail-closed | 审批 Agent 启动失败、超时（可配 30s–600s）、结果不合法 → 一律按拒绝处理，绝不静默放行 |
+| 🔒 Fail-closed | 审批 Agent 启动失败、超时（可配 30s–600s）、结果不合法、**证据不完整（参数取不到或被截断）** → 一律按拒绝处理，绝不静默放行 |
 | ⚙️ 审批模型可配置 | 设置页选择 Provider + Model，不选则固定用 **Harness 默认模型**（不跟随请求会话，口径稳定）；选择与超时**持久保存**，重启不丢 |
+| 🧱 安全加固 | 长参数按「头+尾」呈现给审批员（危险尾部藏不住）；`放行 + tool=* + 空 match` 这种"一键关掉审批"的规则被拒；规则里以 `/` 开头的路径子串不再被误当正则；被截断的审计记录不提供「加白」；委派出的子会话不会被自动开启本模式 |
 | 📋 审计记录（随会话） | 会话窗口顶部的**「审批」标签页**（轨迹旁）查看本会话全部审批：结论 / 风险等级 / 模型 / 耗时 / 理由；悬停看完整理由与**精确工具参数**；审批 Agent 的会话 id 可回溯完整推理；已批准行可一键**「加白」**存为放行规则。记录存在**会话存储目录内的独立文件**——随会话恢复，删除会话即随之删除 |
 | 🔁 可逆开关 | 权限菜单「Agent 审批」预设、`/agent-approval on\|off` 命令两条等价路径；关闭时**恢复开启前的权限旋钮** |
 
@@ -42,7 +43,7 @@
                     ├─ approve → allowed-once（该次放行）
                     ├─ reject  → rejected（风险操作，最终拒绝）
                     └─ 超时/故障/取消 → fail-closed（按拒绝处理）
-              └─ 记入审计（写入会话日志，「审批」标签页可见）
+              └─ 记入审计（会话目录内的旁路文件，「审批」标签页可见；不写会话日志）
 ```
 
 - 审批 Agent 只能看到：workspace 路径、**最近的用户消息**（任务上下文）、工具名、提权理由、**精确的工具参数 JSON**（按 `callId` 从会话日志回查）。裁决看"操作 vs 用户任务"的客观对齐，不依赖理由措辞。
@@ -57,11 +58,15 @@
 
 ```bash
 # 本地开发：pnpm 软链到本仓库，改代码即生效（无需重新复制）
+npm install                                     # ← 必须先装依赖：loader 从插件真实路径加载，
+                                                #   裸导入（cordis/typert-protocol/zod）走插件自己的 node_modules
 dsh plugin --profile web add /path/to/dsh-agent-approval
 
 # 正式发布：从 GitHub Release tarball 安装
-dsh plugin --profile web add https://github.com/MoonlitDropOfBlood/dsh-agent-approval/releases/download/v1.5.0/dsh-agent-approval-1.5.0.tgz
+dsh plugin --profile web add https://github.com/MoonlitDropOfBlood/dsh-agent-approval/releases/download/v1.6.0/dsh-agent-approval-1.6.0.tgz
 ```
+
+> 本地路径安装前**务必先 `npm install`**：缺 `node_modules` 时启动会 `ERR_MODULE_NOT_FOUND`，整个 DSH 起不来。宿主包版本要跟本机 DSH 对齐（避免双副本漂移），详见 [AGENTS.md](AGENTS.md) 第 9 节。
 
 重启 DSH 后：设置面板出现 **Agent 审批** 页；`/permission` 菜单出现第四项 **Agent 审批**。
 
@@ -71,6 +76,8 @@ dsh plugin --profile web add https://github.com/MoonlitDropOfBlood/dsh-agent-app
 > ```
 
 > `dsh plugin add` 把插件装成 profile 的 npm 依赖并追加到 `dsh.profile.bundles`，启动时自动应用包内 patch。卸载：`dsh plugin --profile web remove dsh-agent-approval`。
+>
+> ⚠️ **卸载前建议先在各会话里切回其他权限预设**：历史会话日志里写着 `permission/preset: agent-approval`，而 `dsh-permission-presets` 会在启动时重放校验全部会话日志，对未知预设名报不变量错误（`unknown preset "agent-approval"`）。插件卸载后该预设名就不在表里了，那些会话下次启动会报错。
 
 ## 使用
 
@@ -80,16 +87,30 @@ dsh plugin --profile web add https://github.com/MoonlitDropOfBlood/dsh-agent-app
 4. **配置**：设置 → **Agent 审批** 设置审批模型（不选则用 Harness 默认模型）、审批超时与放行/拒绝规则。
 5. **关闭**：菜单切回其他预设，或 `/agent-approval off`，恢复开启前的沙箱模式与审批策略。
 
+## 安全边界（请读）
+
+这个模式是**风险削减**，不是沙箱边界，也不是分权手段：
+
+- **裁决者是 LLM**，而被审查的 agent 控制操作内容与理由。真正的隔离边界始终是 OS 级沙箱（`workspace-write` / `danger-full-access`）。审批 Agent 的价值在于拦住明显破坏性、不可逆、越界或理由不实的操作，而不是提供密码学保证。
+- **开启即同时放宽两件事**：沙箱基线被钉到 `workspace-write`（若原本是 `read-only`，这就是放宽），并且**人工弹窗被替换为模型裁决**。这正是该模式的用途，但请明确知道自己在授权什么。
+- **证据不完整一律拒绝**：审批员看到的是工具参数的**头部+尾部**（超长时中间以 `…[N chars omitted]…` 标记），参数取不到、为空或带省略标记时**必须拒绝**——因为请求方可以拿无害前缀把危险尾部顶出可见范围。副作用：超过 4000 字符的提权请求会被拒，请把命令写短或拆开。
+- **不允许"全量放行"规则**：`放行 + tool=* + match 留空` 等于一键关掉整个审批控制，`addRule` 直接拒绝（`拒绝` 的同形状仍然允许；手工编辑 `config.json` 仍会被加载）。规则表与审批模型是**全局的**（不区分 workspace / 会话），规则增删也不进审计——加规则时请意识到它影响所有开启本模式的会话。
+- **审计存储依赖一个非公开 hook**：会话目录定位走 `sessionPersistence.locate()`（不在 DSH 公开 API 里）。一旦上游移除它，记录会退回 `<DSH_HOME>/agent-approval/records/`（不再随会话删除），**并在宿主日志打印告警**——这是有意设计，避免"审计看似正常其实已脱离会话"。
+- **Remote 面按可信客户端对待**：`toggle` / `sessionRecords` / `addRule` / `setModel` 都没有调用方归属校验。今天的 Web 客户端与人工审批者同属一个信任域（能弹窗批准的人本来就能放行一切），所以不构成提权；但不要把本插件的 gateway 暴露到跨信任域的场景。
+- **委派子会话不会被自动开启**：DSH 把子代理审批策略钉死为 `never`（子代理拿不到父级没给的权限）。插件在自动重新开启时会跳过 `origin: "subagent"` / 有 `parentSession` 的会话，避免覆盖这条钉死；用户在活着的子会话里**显式**选预设仍然生效。
+
 ## 目录结构
 
 ```
 dsh-agent-approval/
 ├── index.js            # Host 半：AgentApprovalService（审批瀑布抢占 + spawn 审批 Agent + 审计）
-├── client.js           # Client 半：设置页「Agent 审批」+ 输入框开关 UI bundle
-├── typert.host.js      # Typert Host manifest（agentApproval 6 个方法的描述）
+├── lib/pure.js         # 无依赖纯逻辑：规则匹配 / 证据渲染 / shortId（可离线单测）
+├── client.js           # Client 半：设置页「Agent 审批」+「审批」审计标签页 UI bundle
+├── typert.host.js      # Typert Host manifest（agentApproval 8 个方法的描述）
 ├── cordis.patch.yml      # dsh bundle patch（挂载行 + permission 预设表覆盖）
+├── test/pure.test.mjs    # node --test 单测（不需要 DSH 包）
 ├── scripts/patch-glyph.mjs # 可选：权限菜单图标补丁（标准安装不自动执行）
-├── .github/workflows/  # GitHub Actions 发布
+├── .github/workflows/  # GitHub Actions 校验 + 打包 + 发布
 ├── AGENTS.md           # 面向 AI agent 的开发指南（含踩坑）
 └── LICENSE             # MIT
 ```
@@ -97,7 +118,9 @@ dsh-agent-approval/
 ## 开发
 
 ```bash
-npm run check           # node --check index.js client.js typert.host.js
+npm run check           # node --check 全部源码与脚本
+npm test                # node --test：lib/pure.js 的纯逻辑单测
+npm run verify          # check + test
 dsh plugin --profile web add /path/to/dsh-agent-approval   # 安装/重装到本机 DSH profile
 npm run patch:glyph     # 可选：权限菜单图标
 ```

@@ -108,6 +108,27 @@ window.__ModuleLoader__.load({
     const SETTINGS_LABEL = "Agent 审批";
     const SETTINGS_NAV_MARKER = "data-dsh-agent-approval-settings-nav";
 
+    /**
+      Coalesce a DOM-scanning sync onto the next animation frame. Both marker
+      registries observe the whole document with `characterData`, so during
+      streamed model output a mutation arrives per token; running a full-document
+      `querySelectorAll` scan for every one of them is what made the UI stutter.
+      At most one scan per frame is plenty for a cosmetic icon.
+    */
+    function frameCoalesced(run) {
+      let scheduled = false;
+      return function () {
+        if (scheduled) return;
+        scheduled = true;
+        const flush = function () {
+          scheduled = false;
+          run();
+        };
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(flush);
+        else setTimeout(flush, 16);
+      };
+    }
+
     function registerSettingsNavIcon(label) {
       let disposed = false;
       const sync = function () {
@@ -125,7 +146,8 @@ window.__ModuleLoader__.load({
         }
       };
       sync();
-      const observer = new MutationObserver(sync);
+      const schedule = frameCoalesced(sync);
+      const observer = new MutationObserver(schedule);
       observer.observe(document.body, { childList: true, subtree: true, characterData: true });
       return function () {
         disposed = true;
@@ -200,7 +222,8 @@ window.__ModuleLoader__.load({
         }
       };
       sync();
-      const observer = new MutationObserver(sync);
+      const schedule = frameCoalesced(sync);
+      const observer = new MutationObserver(schedule);
       observer.observe(document.body, { childList: true, subtree: true, characterData: true });
       return function () {
         disposed = true;
@@ -385,6 +408,10 @@ window.__ModuleLoader__.load({
       function fmtTime(iso) {
         try {
           const d = new Date(iso);
+          // `new Date(bad)` does not throw — it yields an Invalid Date whose
+          // getters are all NaN, so the throw must be replaced by an explicit
+          // validity test.
+          if (isNaN(d.getTime())) return String(iso);
           const p = (v) => String(v).padStart(2, "0");
           return (
             p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds())
@@ -392,6 +419,19 @@ window.__ModuleLoader__.load({
         } catch (e) {
           return String(iso);
         }
+      }
+
+      /**
+        Whether one audit record's `args` is known to be incomplete. The Host
+        renders long arguments as head + "…[N chars omitted]…" + tail (and
+        1.5.x hosts used a trailing "…[truncated]"), so a rule derived from such
+        a string would be a broad PREFIX/substring rule rather than the exact
+        operation that was approved. Mirrors `isTruncatedEvidence` in
+        lib/pure.js — keep the marker format in sync.
+      */
+      function isTruncatedArgs(text) {
+        if (typeof text !== "string") return false;
+        return /\[\d+ chars omitted\]/.test(text) || text.slice(-12) === "…[truncated]";
       }
 
       // NOTE: no composer chip anymore. The mode lives in the /permission
@@ -489,6 +529,10 @@ window.__ModuleLoader__.load({
         const setRuleMatch = ruleMatchSlot[1];
         const setRuleNote = ruleNoteSlot[1];
         const rules = state !== null && Array.isArray(state.rules) ? state.rules : [];
+        // A host that predates the {id,title,cwd} shape (or omits the field)
+        // must not crash the whole settings section on `.length`/`.map`.
+        const enabledSessions =
+          state !== null && Array.isArray(state.enabledSessions) ? state.enabledSessions : [];
 
         const addRule = (draft) => {
           remote
@@ -620,12 +664,12 @@ window.__ModuleLoader__.load({
             h("h3", null, "已开启的会话"),
             state === null
               ? h("div", { className: "aapr-muted" }, "加载中…")
-              : state.enabledSessions.length === 0
+              : enabledSessions.length === 0
                 ? h("div", { className: "aapr-muted" }, "当前没有会话开启 Agent 审批。")
                 : h(
                     "div",
                     { className: "aapr-row" },
-                    state.enabledSessions.map((raw) => {
+                    enabledSessions.map((raw) => {
                       // New hosts send { id, title, cwd }; a not-yet-restarted
                       // old host still sends bare id strings — render both.
                       const info =
@@ -664,7 +708,7 @@ window.__ModuleLoader__.load({
             h(
               "div",
               { className: "aapr-muted" },
-              "命中规则的提权不再经过审批模型：拒绝规则直接拒、放行规则直接过（拒绝优先于放行）。match 留空 = 该工具全部调用；否则是参数 JSON 的子串，或 /正则/flags 形式。另：模型批准后，同一会话内参数完全相同的再次提权直接放行（会话内信任，不跨会话、不泛化）。",
+              "命中规则的提权不再经过审批模型：拒绝规则直接拒、放行规则直接过（拒绝优先于放行）。match 留空 = 该工具全部调用（仅限具体工具名，不允许「放行 + * + 空 match」这种全量放行）；否则是参数 JSON 的子串，或 /正则/flags 形式（必须以 / 闭合，例如 /foo/i；否则按子串处理）。另：模型批准后，同一会话内参数完全相同的再次提权直接放行（会话内信任，不跨会话、不泛化）。",
             ),
             rules.length === 0
               ? h("div", { className: "aapr-muted" }, "暂无规则。")
@@ -753,11 +797,21 @@ window.__ModuleLoader__.load({
           };
         }, [sessionId, tick]);
 
-        // One-click whitelist from an audit row: the recorded args are a
-        // PREFIX of the real arguments JSON (the Host truncates at 2000
-        // chars), so stripping the truncation marker keeps a valid substring.
+        // One-click whitelist from an audit row. The recorded `args` is used
+        // verbatim as the rule's substring, which is only safe when the record
+        // holds the COMPLETE arguments JSON: a truncated record would produce a
+        // rule that also matches any longer command sharing its head/tail.
+        // Truncated rows therefore refuse instead of quietly widening access.
         const whitelistRecord = (r) => {
-          const args = String(r.args || "").replace(/…\[truncated\]$/, "");
+          const args = String(r.args || "");
+          if (isTruncatedArgs(args)) {
+            setNote("该记录的参数被截断，无法生成精确规则；请在设置页手动填写 match。");
+            return;
+          }
+          if (args === "") {
+            setNote("该记录没有保存工具参数，无法生成规则。");
+            return;
+          }
           remote
             .addRule({
               effect: "allow",
@@ -843,13 +897,13 @@ window.__ModuleLoader__.load({
                             h(
                               "td",
                               null,
-                              r.outcome === "allowed-once" && r.args && r.model !== "rule"
+                              r.outcome === "allowed-once" && r.args && r.model !== "rule" && !isTruncatedArgs(r.args)
                                 ? h(
                                     "button",
                                     {
                                       className: "aapr-whitelist",
                                       onClick: () => whitelistRecord(r),
-                                      title: "把该操作存为放行规则（工具 + 参数子串）：今后直接放行，不再经过审批模型",
+                                      title: "把该操作存为放行规则（工具 + 完整参数子串）：今后直接放行，不再经过审批模型",
                                     },
                                     "加白",
                                   )
