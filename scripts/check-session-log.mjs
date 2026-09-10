@@ -12,9 +12,13 @@
 // Vocabulary note: the event set is version-specific, and a stale copy makes
 // the checker LIE — a type the installed harness knows gets reported as
 // "would refuse to load", and a type it does not know gets reported as fine.
-// The checker therefore prefers the INSTALLED harness's own export and only
-// falls back to the snapshot below (verified against DSH 0.1.3-alpha.2) when
-// `@deepseek-ai/dsh-session` is not resolvable from here.
+// The checker therefore TRIES the installed harness's own export first and
+// falls back to the snapshot below (verified entry-for-entry against DSH
+// 0.1.3-alpha.2). In practice the probe usually fails: a `link:`-installed
+// plugin has only cordis/typert-protocol/zod in its own node_modules, and the
+// profile's `dsh-session` is not on this script's resolution path — so the
+// SNAPSHOT is what normally runs, and it is what must be kept in sync after a
+// DSH upgrade (the CLI prints which source was used).
 //
 // Usage: node scripts/check-session-log.mjs <session.jsonl.zstd> [...more]
 // Library use: import { auditLog } from this module.

@@ -31,6 +31,8 @@ dsh-agent-approval/
 └── LICENSE               # MIT
 ```
 
+`package.json` 的 `files` 收 `index.js` / `lib` / `client.js` / `typert.host.js` / `cordis.patch.yml` / `test` / `scripts`——**新增运行时代码必须同时加进 `files`**（漏了 `lib` 会让安装后的 `import "./lib/pure.js"` 直接 ERR_MODULE_NOT_FOUND）。`test`/`scripts` 一起随包分发是为了让 `npm test` / `npm run check` 在装了 tarball 的目录里也能跑。
+
 ## 关键机制
 
 ### 1. DSH 正式插件 = 三件套（Host / Client / Typert）
@@ -94,7 +96,7 @@ const run = await this.ctx.subagents.start("spawn", {
 
 - **裁决 schema 必须是 JSON-Schema 受限子集**（`assertObjectJsonSchema`）：只允许 `type/properties/required/additionalProperties/items/enum/const` + 注解。不要写 `pattern`、`format`、数值范围。
 - **零工具**：`toolFilter: {allow: []}` 合法（空 allow 数组不是 no-op——no-op 判定只针对 allow/deny **都缺失**），审批员只能"看"和"判"，不能"做"。**唯一例外**：presentation mode 非 `native`（PTC）时官方会无条件把保留传输层 `run_code` 加回可见集——它只绑定"当前可见工具"（此处为空），所以到不了任何工具，但"全局工具全部空白"这句在 PTC 部署下要加限定。
-- **不会递归审批**：DSH 委派机制自动把子代理的审批策略钉死为 `never`（`captureDelegatedPolicyOverrides`，**最后事件胜出**的日志覆盖），子代理自己提权会在派发前直接 `rejected`。v1.6.0 起本插件在 `agent/created` 里**跳过委派子会话**（`header.origin === "subagent"` 或有 `parentSession`），否则 fork 子会话 seed 里父级的 `permission/preset: agent-approval` 会让 `_enableCore` 把 `never` 改回 `ask`，静默推翻这条钉死（见第 8.5 节）。
+- **不会递归审批**：DSH 委派机制自动把子代理的审批策略钉死为 `never`（`captureDelegatedPolicyOverrides`，**最后事件胜出**的日志覆盖），子代理自己提权会在派发前直接 `rejected`。v1.6.0 起本插件在 `agent/created` 里**跳过委派子会话**（`isDelegatedChildHeader()`，判据只有 `header.origin === "subagent"`），否则 fork 子会话 seed 里父级的 `permission/preset: agent-approval` 会让 `_enableCore` 把 `never` 改回 `ask`，静默推翻这条钉死（见第 8.5 节）。
 - **结果读取**：`run.result`（Promise，不 reject 业务失败）→ `result.structured`（合法裁决）+ `result.stopReason === "completed"`（合法值只有 `completed/aborted/error/max-tokens/refusal`；干净跑完但没拿到结构化捕获时 `structured` **缺键**且 stopReason 被强制为 `error`）。任一不满足 → `unavailable`（fail-closed）。
 - **竞速**：`Promise.race([run.result, abortRace, timeoutRace])`，`finally` 里 `clearTimeout` + `removeEventListener("abort", …)` + `run.dispose().catch(()=>{})`。**不要改回 `this.ctx.timeout(ms)`**：它返回的 promise 无法取消，竞速落败后那个 `setTimeout` 会一直武装到超时（最长 600s），且其 effect 属于 timer 服务的 fiber（插件卸载也不释放），teardown 时的 `reject` 还会变成未处理拒绝。超时/取消/基础设施故障分别映射 `unavailable`/`cancelled`。`run.dispose()` 刻意不 await：fail-closed 结论不应被"等子会话静默"拖延（子会话由父 agent 卸载兜底回收）。
 - **给审批员看的材料**：从会话日志按 `callId` 倒查 `tool/call` 事件的 `arguments` 原始 JSON（**精确命令**，不是转述；已核实该字段是 string 且在 `startCall()` 里先于 dispatch 落盘，所以一定查得到）、`req.reason`（工具方的提权理由）、workspace cwd、以及**首条真实用户消息（原始任务陈述）+ 最近 3 条真实用户消息**（`user/message` 且 `source.kind === "user"`，每条截断 800——任务的 ground truth；短会话里首条已在最近列表中则去重）。审批提示词明确 APPROVE 条件与 REJECT 清单；v1.4.0 起**删除"存疑即拒"**——拒绝必须能指出该操作的**具体可信风险点**（毁什么/泄什么/越什么界），笼统不确定、没见过的命令、简略的理由都不是拒绝理由（误杀治理，见第 5 节规则表）。
@@ -107,7 +109,7 @@ const run = await this.ctx.subagents.start("spawn", {
 
 提权进入 `_judge` 后按固定顺序短路，全部**零模型开销、零人工弹窗**：
 
-1. **deny 规则命中 → 直接 `rejected`**（所有 deny 先于任何 allow 判定，后加的 deny 永远压过先加的 allow）；**allow 规则命中 → 直接 `allowed-once`**。规则形状 `{ id, effect, tool, match, note, createdAt }`，持久化在 config.json 的 `rules` 字段：`tool` 为精确工具名或 `"*"`；`match` 为空 = **该工具**全部调用（v1.6.0 起 `addRule` **拒绝** `allow + tool:"*" + match:""` 这种"全量放行"——它等于一键关掉整个审批控制，且无确认、无审计；`deny` 的同形状仍然允许，手工编辑 config.json 也仍然会被加载），否则是**参数原始 JSON 的子串**或 `/pattern/flags` 正则。**正则形状有守卫（v1.6.0 修复）**：必须 `/` 开头、有闭合 `/`、且闭合斜杠后只能是合法 JS flags——否则按子串处理。修掉的是这一种坏结果：以 `/` 开头且含第二个 `/` 的**路径子串**（`/usr/bin`、`/tmp/x.log`、`/etc/passwd`、`/C:/Users/x`）在旧代码里会走到 `new RegExp(body, "bin")` → 抛错 → `null` → **永不命中**——于是 allow 规则静默失效、而 **deny 规则会静默漏放行**（差分测试确认：旧 `oldRe("/usr/bin")` 为 `null`，新为 substring）。**残留歧义（无法消除，别当 bug）**：`/usr/i`、`/tmp/g` 这类"路径尾部恰好是合法 flag"的写法**新旧都按正则**处理，因为 `/usr/i` 与"带 `i` 标志的正则 `usr`"完全同形。要精确匹配这种路径，别用斜杠包裹（直接写 `usr/i` 就是子串），或以后引入显式 `re:` 前缀。`ruleRegex` 编译失败 = 永不命中，`addRule` 时即校验拒绝。规则命中也写审计（model 列记 `rule`）。**匹配原语都在 `lib/pure.js`**（`ruleRegex`/`ruleMatches`/`matchRules`/`isBlanketAllow`），改它们必须同时改 `test/pure.test.mjs`。
+1. **deny 规则命中 → 直接 `rejected`**（所有 deny 先于任何 allow 判定，后加的 deny 永远压过先加的 allow）；**allow 规则命中 → 直接 `allowed-once`**。规则形状 `{ id, effect, tool, match, note, createdAt }`，持久化在 config.json 的 `rules` 字段：`tool` 为精确工具名或 `"*"`；`match` 为空 = **该工具**全部调用（v1.6.0 起 `addRule` **拒绝** `allow + tool:"*" + match 为空或纯空白` 这种"全量放行"——`match:" "` 是每个含空格的参数 JSON 都命中的子串，等价于空 match；它等于一键关掉整个审批控制，且无确认、无审计。`deny` 的同形状仍然允许，手工编辑 config.json 也仍然会被加载），否则是**参数原始 JSON 的子串**或 `/pattern/flags` 正则。**正则形状有守卫（v1.6.0 修复）**：必须 `/` 开头、有闭合 `/`、且闭合斜杠后只能是合法 JS flags——否则按子串处理。修掉的是这一种坏结果：以 `/` 开头且含第二个 `/` 的**路径子串**（`/usr/bin`、`/tmp/x.log`、`/etc/passwd`、`/C:/Users/x`）在旧代码里会走到 `new RegExp(body, "bin")` → 抛错 → `null` → **永不命中**——于是 allow 规则静默失效、而 **deny 规则会静默漏放行**（差分测试确认：旧 `oldRe("/usr/bin")` 为 `null`，新为 substring）。**残留歧义（无法消除，别当 bug）**：`/usr/i`、`/tmp/g` 这类"路径尾部恰好是合法 flag"的写法**新旧都按正则**处理，因为 `/usr/i` 与"带 `i` 标志的正则 `usr`"完全同形。要精确匹配这种路径，别用斜杠包裹（直接写 `usr/i` 就是子串），或以后引入显式 `re:` 前缀。`ruleRegex` 编译失败 = 永不命中，`addRule` 时即校验拒绝。规则命中也写审计（model 列记 `rule`）。**匹配原语都在 `lib/pure.js`**（`ruleRegex`/`ruleMatches`/`matchRules`/`isBlanketAllow`），改它们必须同时改 `test/pure.test.mjs`。
 2. **会话内信任缓存**：模型 approve 后把 `工具名 + "\n" + 参数原始 JSON` 指纹存入该会话的 Set（`_trusted` Map）；同一会话内**参数逐字节相同**的再次提权直接 `allowed-once`（审计 model 列记 `trust`）。**不跨会话、不泛化到相似参数**，随 `_enabled` 条目一起在三处删除点清空（preset 切走 / session disposed / `_disable`）。跨会话复用走规则表：会话窗口「审批」tab 审计行的「加白」按钮一键把已批准操作存成 allow 规则——**只在记录里的 args 完整时才允许**（`isTruncatedArgs`：含 `…[N chars omitted]…` 或旧版 `…[truncated]` 即拒绝并提示手填），因为拿一个被截断的前缀/头尾串生成的规则会顺带放行所有共享该片段的更长命令。
 3. 都不命中才 spawn 审批模型。
 
@@ -149,7 +151,8 @@ const run = await this.ctx.subagents.start("spawn", {
 4. **事件联动**（`session/event` 监听 `permission/preset`）：
    - 选中 `agent-approval` → `_enableCore`（此刻旋钮事件还没落，捕获的 prev 恰是切换前的值；我们写的旋钮值与预设服务随后要写的相同，它检查后跳过，无重复事件）。
    - 选中其他预设 → 只删 bookkeeping，**不恢复旋钮**（预设服务马上写自己的旋钮，恢复会打架）。
-5. **跨重启存活（v1.6.0 起不含委派子会话）**：`agent/created` 监听在（重）发布时折叠日志——`permission/preset` 折出 `agent-approval` 就重新启用。**但是**：spawn 的审批员子会话不带 preset 事件（无 seed）；fork 子会话的 seed 里**带**父级的 preset 事件，而 `pinInitialPermission` 不会为它改写（`selected !== null`）——若不拦截，`_enableCore` 会执行 `approval.setPolicy(agent, "ask")`，**把委派机制钉死的 `never` 覆盖掉**，等于让被委派的子代理拿到它本不该有的提权通道。因此 v1.6.0 起 `_isDelegatedChild(session)`（`header.origin === "subagent"` 或 `header.parentSession !== undefined`）命中就 **return，不自动启用**。用户在某个活着的子会话里**显式**选预设仍会生效（`session/event` 路径不动，用户意图优先）。改这里时别只测 fork，也测"父会话开启 → 重启 DSH → 子会话不得自动开启"。
+5. **跨重启存活（v1.6.0 起不含委派子会话）**：`agent/created` 监听在（重）发布时折叠日志——`permission/preset` 折出 `agent-approval` 就重新启用。**但是**：spawn 的审批员子会话不带 preset 事件（无 seed）；fork 子会话的 seed 里**带**父级的 preset 事件，而 `pinInitialPermission` 不会为它改写（`selected !== null`）——若不拦截，`_enableCore` 会执行 `approval.setPolicy(agent, "ask")`，**把委派机制钉死的 `never` 覆盖掉**，等于让被委派的子代理拿到它本不该有的提权通道。因此 v1.6.0 起判据是 `_isDelegatedChild(session)`（纯函数 `isDelegatedChildHeader()`）：**只认 `header.origin === "subagent"`**，命中就 return，不自动启用。用户在某个活着的子会话里**显式**选预设仍会生效（`session/event` 路径不动，用户意图优先）。
+   **⚠️ 绝对不要改成 `|| header.parentSession !== undefined`（v1.6.0 第一版踩过，已修）**：只有委派会写 `origin: "subagent"`（`dsh-subagent` 的 `childSessionMeta` 每个子会话都写），而**用户自己的 fork**（`dsh-api-session-controller` 的 session fork）只写 `meta.parentSession` + `isSeeded`、**不写 origin**，也不会被 `pinInitialPermission` 钉成 `never`。用 `parentSession` 当判据会把用户 fork 误判成委派子会话，于是它 seed 里的 `agent-approval` **永远不会**重新启用——而 `/permission` 菜单仍显示该预设为选中态、审计页却写"未开启"，每次提权都退回人工弹窗。harness 自己的判据也是 `origin === "subagent"`（`hasApiSessionSubagentOwner`）。测试已固定该行为（`isDelegatedChildHeader` 用例）。
 6. **防御**：`_presetRegistered()` 先确认表里有 `agent-approval` 才追加 preset 事件——没装覆盖行时，追加会被会话不变量（unknown preset）直接抛错。
 7. **宿主 Session API 兼容（v1.4.2 修复的真实故障）**：DSH 0.1.2-rc.1 **删除了 `session.events` 公开快照数组**，改为 `snapshotEvents(from?, to?)` / `eventAt(seq)` / `seq`。插件所有日志折叠（`_lastKnob` / `_callArgsOf` / `_recentUserContext`）必须走 `_eventsOf(session)`（新 API 优先，legacy 数组兜底）。0.1.1→0.1.2-rc.1 升级后的症状极具欺骗性：监听器 try/catch 把 TypeError 吞掉，`_enableCore` 静默失败，没有任何会话能进入 `_enabled`，于是每个提权都 `next()` 落回人工弹窗——看起来"插件在运行但就是不审批"。**改任何读日志的代码前先确认没用裸 `session.events`。**
 8. （已随 composer chip 的移除而作废）曾有的 chip 每 10s 轮询一次 enabled 状态；若未来重加 chip，注意 InputZone 的 ConversationSnapshot **没有** projections 字段，读不了 `permissions` 投影，只能轮询。
@@ -206,8 +209,8 @@ npm run patch:glyph      # 可选：权限菜单图标（幂等）
 5. 菜单切到 danger-full-access：模式自动关闭（`permission/preset` 事件联动，立即生效）；菜单切回 Agent 审批：模式自动开启，无需手动执行命令。
 6. 把审批超时调成 30000ms、审批模型指向一个不存在的路由 → 提权应 fail-closed 拒绝并记录 `unavailable`。
 7. 设置页加一条 allow 规则（如工具 `pwsh` + match 子串）→ 命中的提权**不再起审批子代理**，审计 model 列显示 `rule`；模型批准的提权在同一会话内以完全相同参数再次发起 → 直接放行，model 列显示 `trust`；「审批」tab 审计行点「加白」→ 规则表新增对应 allow 规则。
-8. **全量放行被拒（v1.6.0）**：设置页填 `effect=放行`、`tool=*`、`match` 留空 → 保存应报错 `invalid-rule`（同样的形状选「拒绝」则允许）。
-9. **子代理不被自动开启（v1.6.0）**：父会话开启本模式后 fork 出子会话 / 重启 DSH → 子会话的审批策略应仍是 `never`（日志里最后一次 `approval/policy` 仍是 `source: "delegation"`），不会出现插件写的 `ask`。
+8. **全量放行被拒（v1.6.0）**：设置页填 `effect=放行`、`tool=*`、`match` 留空（或只填空格）→ 保存应报错 `invalid-rule`（同样的形状选「拒绝」则允许）。
+9. **委派子会话不被自动开启，用户 fork 仍会被自动开启（v1.6.0，两者别搞混）**：由 subagent 委派产生的 fork 子会话（`header.origin === "subagent"`）在重启后审批策略应仍是 `never`（日志里最后一次 `approval/policy` 仍是 `source: "delegation"`），不会出现插件写的 `ask`；而**用户在侧栏 fork 出来的会话**（只有 `parentSession`、没有 origin）继承 seed 里的 `agent-approval` preset 后，必须照旧被 `agent/created` 自动开启（否则菜单显示已选中、实际不裁决）。
 
 ## 发布
 

@@ -17,11 +17,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  APPROVAL_OUTCOMES,
   EVIDENCE_LIMIT,
   RECORD_ARGS_LIMIT,
   errText,
   evidenceText,
+  isApprovalOutcome,
   isBlanketAllow,
+  isDelegatedChildHeader,
   isTruncatedEvidence,
   matchRules,
   newRuleId,
@@ -173,6 +176,40 @@ test("isBlanketAllow only flags the allow-everything shape", () => {
   assert.equal(isBlanketAllow("deny", "*", ""), false); // lockdown stays legal
   assert.equal(isBlanketAllow("allow", "*", "git"), false);
   assert.equal(isBlanketAllow("allow", "pwsh", ""), false);
+  // Whitespace-only is the same off switch typed with one extra keystroke:
+  // `match: " "` is a substring every JSON arguments object with a space hits.
+  assert.equal(isBlanketAllow("allow", "*", " "), true);
+  assert.equal(isBlanketAllow("allow", "*", "   "), true);
+  assert.equal(isBlanketAllow("allow", "*", "\t"), true);
+  assert.equal(isBlanketAllow("deny", "*", " "), false);
+  assert.equal(isBlanketAllow("allow", "*", " g "), false);
+  assert.equal(isBlanketAllow("allow", "*", undefined), true);
+});
+
+// ---- delegated-child classification ----------------------------------------
+
+test("isDelegatedChildHeader matches ONLY delegation-created children", () => {
+  // Set by @deepseek-ai/dsh-subagent childSessionMeta on every spawn/fork child.
+  assert.equal(isDelegatedChildHeader({ origin: "subagent", parentSession: "session-p" }), true);
+  assert.equal(isDelegatedChildHeader({ origin: "subagent" }), true);
+  // A USER fork sets parentSession with NO origin — it must stay eligible for
+  // the automatic re-arm, otherwise the permission menu shows the preset as
+  // selected while nothing actually judges. (Regression pinned here.)
+  assert.equal(isDelegatedChildHeader({ parentSession: "session-p", isSeeded: true }), false);
+  assert.equal(isDelegatedChildHeader({}), false);
+  assert.equal(isDelegatedChildHeader(null), false);
+  assert.equal(isDelegatedChildHeader(undefined), false);
+  assert.equal(isDelegatedChildHeader("subagent"), false);
+});
+
+// ---- approval outcome vocabulary -------------------------------------------
+
+test("isApprovalOutcome accepts exactly the wire vocabulary", () => {
+  assert.deepEqual(APPROVAL_OUTCOMES, ["allowed-once", "rejected", "cancelled", "unavailable"]);
+  for (const outcome of APPROVAL_OUTCOMES) assert.equal(isApprovalOutcome(outcome), true);
+  for (const bad of [undefined, null, "", "APPROVED", "allow", "allowed", 0, {}, []]) {
+    assert.equal(isApprovalOutcome(bad), false, "must reject " + JSON.stringify(bad));
+  }
 });
 
 // ---- evidence rendering -----------------------------------------------------
@@ -207,6 +244,26 @@ test("evidenceText reports the number of omitted characters", () => {
   assert.ok(rendered.includes("[90 chars omitted]"), rendered);
   assert.equal(rendered.slice(0, 6), "zzzzzz");
   assert.equal(rendered.slice(-4), "zzzz");
+});
+
+test("evidenceText never returns the whole input for a tiny budget", () => {
+  // Regression: `tail = n - head` is 0 for a 1- or 2-char budget, and
+  // `slice(-0)` === `slice(0)` === the ENTIRE string — which silently undid the
+  // truncation. The tail must be empty in that case, and the result must stay
+  // bounded (budget + the marker).
+  const args = "ABCDEFGHIJ";
+  for (const n of [1, 2, 3, 4]) {
+    const rendered = evidenceText(args, n);
+    assert.ok(rendered.includes("chars omitted"), "n=" + n + " must mark the omission: " + JSON.stringify(rendered));
+    assert.ok(!rendered.includes(args), "n=" + n + " must not embed the full input");
+    assert.ok(rendered.length <= n + 40, "n=" + n + " length " + rendered.length);
+  }
+  // A budget of 1 legitimately degrades to "show the first char, mark the rest".
+  assert.equal(evidenceText(args, 1), "A\n…[9 chars omitted]…\n");
+  // Budgets of 3+ still keep both ends.
+  const three = evidenceText(args, 3);
+  assert.ok(three.startsWith("AB"));
+  assert.ok(three.endsWith("J"));
 });
 
 test("isTruncatedEvidence detects both markers and rejects ordinary text", () => {

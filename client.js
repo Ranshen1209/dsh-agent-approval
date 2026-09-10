@@ -528,11 +528,14 @@ window.__ModuleLoader__.load({
         const setRuleTool = ruleToolSlot[1];
         const setRuleMatch = ruleMatchSlot[1];
         const setRuleNote = ruleNoteSlot[1];
-        const rules = state !== null && Array.isArray(state.rules) ? state.rules : [];
+        // `pick()` can hand back `undefined`, so a plain `!== null` test is not
+        // enough: `undefined.rules` still throws and would kill the whole
+        // settings section during render.
+        const rules = state && Array.isArray(state.rules) ? state.rules : [];
         // A host that predates the {id,title,cwd} shape (or omits the field)
-        // must not crash the whole settings section on `.length`/`.map`.
+        // must not crash the whole settings section on `.length`/`.map` either.
         const enabledSessions =
-          state !== null && Array.isArray(state.enabledSessions) ? state.enabledSessions : [];
+          state && Array.isArray(state.enabledSessions) ? state.enabledSessions : [];
 
         const addRule = (draft) => {
           remote
@@ -823,10 +826,10 @@ window.__ModuleLoader__.load({
             .catch((e) => setNote("加白失败：" + (e && e.message ? e.message : String(e))));
         };
 
-        const records = state !== null && Array.isArray(state.records) ? state.records : [];
+        const records = state && Array.isArray(state.records) ? state.records : [];
         // 倒序展示（最新在最上）；Host 仍按时间正序返回，顺序属于视图层。
         const ordered = records.slice().reverse();
-        const enabled = state !== null ? !!state.enabled : null;
+        const enabled = state ? !!state.enabled : null;
 
         return h(
           "div",

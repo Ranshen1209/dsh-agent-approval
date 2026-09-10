@@ -64,7 +64,9 @@ import {
   RECORD_ARGS_LIMIT,
   errText,
   evidenceText,
+  isApprovalOutcome,
   isBlanketAllow,
+  isDelegatedChildHeader,
   isTruncatedEvidence,
   matchRules,
   newRuleId,
@@ -396,23 +398,23 @@ export class AgentApprovalService extends TypertRemoteService {
   }
 
   /**
-   * Whether this session was created as a delegated subagent child. DSH marks
-   * that on the durable header (`origin: "subagent"` for any spawn/fork child,
-   * `parentSession` for fork lineage). Used to keep the automatic re-arm from
-   * overriding the delegation's `never` approval pin — see `agent/created`.
+   * Whether this session was created as a DELEGATED subagent child (as opposed
+   * to a session the user started or forked themselves). Used to keep the
+   * automatic re-arm from overriding the delegation's `never` approval pin —
+   * see `agent/created`. The classification itself is the pure, unit-tested
+   * {@link isDelegatedChildHeader}; read its doc before changing it, because
+   * matching `parentSession` would also catch USER forks.
    *
    * A header read failure returns false (preserve the ordinary re-arm) rather
    * than true: silently dropping the mode for a healthy session is the exact
    * failure class this plugin has been burned by before.
    *
    * @param session - the session to classify.
-   * @returns whether the session is a delegated child.
+   * @returns whether the session is a delegation-created child.
    */
   _isDelegatedChild(session) {
     try {
-      const header = session ? session.header : undefined;
-      if (header === undefined || header === null) return false;
-      return header.origin === "subagent" || header.parentSession !== undefined;
+      return isDelegatedChildHeader(session ? session.header : undefined);
     } catch (e) {
       return false;
     }
@@ -622,7 +624,11 @@ export class AgentApprovalService extends TypertRemoteService {
       toolName: text(entry.toolName),
       reason: text(entry.reason),
       args: text(entry.args),
-      outcome: entry.outcome,
+      // Must always satisfy the strict wire enum. An unreadable verdict is
+      // coerced to `unavailable` (fail closed) rather than passed through: a
+      // single malformed value would otherwise fail the whole `sessionRecords`
+      // result validation and blank the entire「审批」tab for that session.
+      outcome: isApprovalOutcome(entry.outcome) ? entry.outcome : "unavailable",
       riskLevel: text(entry.riskLevel),
       model: text(entry.model),
       durationMs: Number(entry.durationMs) || 0,
@@ -690,6 +696,10 @@ export class AgentApprovalService extends TypertRemoteService {
    * Fold one session's audit records (chronological by `at`). The sidecar
    * file is the ONLY source — the durable event log is never consulted
    * (v1.5.2: zero custom data read from or written to session.jsonl.zstd).
+   *
+   * Lines that are not well-formed records are SKIPPED, not coerced: one
+   * junk line in a hand-edited or pre-upgrade sidecar must not be able to fail
+   * the strict wire validation of the whole result and blank the「审批」tab.
    * Never throws.
    */
   async _recordsOf(session) {
@@ -702,7 +712,7 @@ export class AgentApprovalService extends TypertRemoteService {
         if (line === "") continue;
         try {
           const parsed = JSON.parse(line);
-          if (parsed && typeof parsed === "object" && typeof parsed.at === "string") {
+          if (parsed && typeof parsed === "object" && typeof parsed.at === "string" && isApprovalOutcome(parsed.outcome)) {
             out.push(this._recordShape(session.id, parsed));
           }
         } catch (e) {

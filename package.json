@@ -24,7 +24,9 @@
     "lib",
     "client.js",
     "typert.host.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "test",
+    "scripts"
   ],
   "license": "MIT",
   "dsh": {
