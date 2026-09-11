@@ -12,45 +12,93 @@
 // Vocabulary note: the event set is version-specific, and a stale copy makes
 // the checker LIE — a type the installed harness knows gets reported as
 // "would refuse to load", and a type it does not know gets reported as fine.
-// The checker therefore TRIES the installed harness's own export first and
-// falls back to the snapshot below (verified entry-for-entry against DSH
-// 0.1.3-alpha.2). In practice the probe usually fails: a `link:`-installed
-// plugin has only cordis/typert-protocol/zod in its own node_modules, and the
-// profile's `dsh-session` is not on this script's resolution path — so the
-// SNAPSHOT is what normally runs, and it is what must be kept in sync after a
-// DSH upgrade (the CLI prints which source was used).
+// The checker resolves the vocabulary in three steps, most authoritative
+// first, and the CLI prints which one won:
+//
+//   1. `import("@deepseek-ai/dsh-session")` — works when the script runs from
+//      a tree whose node_modules (or an ancestor's) carries the harness.
+//   2. the DSH profile's own copy, by absolute path (see
+//      `profileVocabularyCandidates`) — a profile installs the harness as a
+//      real dependency, so this is the usual winner on a developer machine
+//      even though step 1 fails for a `link:`-installed plugin.
+//   3. the bundled snapshot below, verified entry-for-entry against DSH
+//      0.1.5-rc.1 and sorted the same way the harness sorts it.
+//
+// Step 2 exists because step 3 HAS gone stale twice: the host moved
+// 0.1.3-alpha.2 -> 0.1.5-rc.1 and renamed `tool/code-dispatch*` to
+// `tool/ptc-dispatch*` while adding `deliverables/presented`,
+// `subagent/catalog` and `system/message`. Re-check the snapshot after every
+// DSH upgrade, and treat a stale one as a bug in this script, not a log fault.
 //
 // Usage: node scripts/check-session-log.mjs <session.jsonl.zstd> [...more]
 // Library use: import { auditLog } from this module.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MAGIC = 0xfd2fb528;
 
-/** Snapshot of `KNOWN_SESSION_EVENT_TYPES` for DSH 0.1.3-alpha.2. */
+/** Snapshot of `KNOWN_SESSION_EVENT_TYPES` for DSH 0.1.5-rc.1. */
 const FALLBACK_SESSION_EVENT_TYPES = [
   "agent-preset/selected", "agent/inbox/spliced", "approval/asked", "approval/decided",
-  "approval/policy", "assistant/attempt", "assistant/message", "command/done", "command/run",
-  "compaction/end", "compaction/prune", "compaction/start", "compaction/summary",
-  "feedback/message-delete", "feedback/message-put", "feedback/record", "goal/change",
-  "hook/invoked", "hook/result", "llm/retry", "llm/retry-started", "model/selection",
-  "permission/preset", "plan/mode", "request/context", "request/header", "sandbox/mode",
-  "schedule/change", "session-log-deepseek/delivery-accepted", "session/end-seed",
-  "session/title", "session/title-llm-request", "step/end", "step/start",
-  "subagent/descriptor", "subagent/model-selection-policy", "team/member",
+  "approval/policy", "assistant/attempt", "assistant/message", "command/done",
+  "command/run", "compaction/end", "compaction/prune", "compaction/start",
+  "compaction/summary", "deliverables/presented", "feedback/message-delete", "feedback/message-put",
+  "feedback/record", "goal/change", "hook/invoked", "hook/result",
+  "llm/retry", "llm/retry-started", "model/selection", "permission/preset",
+  "plan/mode", "request/context", "request/header", "sandbox/mode",
+  "schedule/change", "session-log-deepseek/delivery-accepted", "session/end-seed", "session/title",
+  "session/title-llm-request", "step/end", "step/start", "subagent/catalog",
+  "subagent/descriptor", "subagent/model-selection-policy", "system/message", "team/member",
   "team/message/delivered", "team/message/queued", "team/task", "todo/write",
-  "tool-workflow/agent-end", "tool-workflow/agent-start", "tool-workflow/run-end",
-  "tool-workflow/run-start", "tool/call", "tool/code-dispatch",
-  "tool/code-dispatch-start", "tool/result", "turn/end", "turn/start", "user/message",
-  "web/deepseek-search-llm-request",
+  "tool-workflow/agent-end", "tool-workflow/agent-start", "tool-workflow/run-end", "tool-workflow/run-start",
+  "tool/call", "tool/ptc-dispatch", "tool/ptc-dispatch-start", "tool/result",
+  "turn/end", "turn/start", "user/message", "web/deepseek-search-llm-request",
 ];
 
+/**
+ * The installed harness's `known-event-types` module inside every DSH profile,
+ * as absolute file URLs. A profile installs the harness as a real dependency,
+ * so this reaches the authoritative vocabulary even when the bare import
+ * cannot resolve. Best-effort: a missing tree yields no candidates.
+ * @returns candidate module specifiers, most preferred first.
+ */
+function profileVocabularyCandidates() {
+  const out = [];
+  try {
+    const home = process.env.DSH_HOME || join(homedir(), ".dsh");
+    const profiles = join(home, "profiles");
+    for (const profile of readdirSync(profiles)) {
+      const candidate = join(
+        profiles,
+        profile,
+        "node_modules",
+        "@deepseek-ai",
+        "dsh-session",
+        "lib",
+        "types",
+        "known-event-types.js",
+      );
+      if (existsSync(candidate)) out.push(pathToFileURL(candidate).href);
+    }
+  } catch (e) {
+    /* no profile tree — the bundled snapshot stays in charge */
+  }
+  return out;
+}
+
 /** Where the active vocabulary came from (reported by the CLI for honesty). */
-export let eventTypeSource = "bundled snapshot (DSH 0.1.3-alpha.2)";
+export let eventTypeSource = "bundled snapshot (DSH 0.1.5-rc.1)";
 const KNOWN_SESSION_EVENT_TYPES = new Set(FALLBACK_SESSION_EVENT_TYPES);
 
-for (const specifier of ["@deepseek-ai/dsh-session", "@deepseek-ai/dsh-session/types"]) {
+const candidates = [
+  "@deepseek-ai/dsh-session",
+  "@deepseek-ai/dsh-session/types",
+  ...profileVocabularyCandidates(),
+];
+for (const specifier of candidates) {
   try {
     const mod = await import(specifier);
     const found = mod.KNOWN_SESSION_EVENT_TYPES;
@@ -58,11 +106,13 @@ for (const specifier of ["@deepseek-ai/dsh-session", "@deepseek-ai/dsh-session/t
     if (asSet !== undefined && asSet.size > 0) {
       KNOWN_SESSION_EVENT_TYPES.clear();
       for (const type of asSet) KNOWN_SESSION_EVENT_TYPES.add(type);
-      eventTypeSource = "installed " + specifier;
+      eventTypeSource = specifier.startsWith("file:")
+        ? "installed harness at " + fileURLToPath(specifier)
+        : "installed " + specifier;
       break;
     }
   } catch (e) {
-    /* not resolvable from this script's location — keep the snapshot */
+    /* not resolvable from this script's location — try the next candidate */
   }
 }
 

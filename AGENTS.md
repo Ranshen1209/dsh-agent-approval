@@ -121,6 +121,7 @@ const run = await this.ctx.subagents.start("spawn", {
 - 每条裁决由 Host `_record(session, entry)` 追加到**请求会话自己存储目录里的旁路文件** `<sessionDir>/agent-approval.jsonl`，目录经 `sessionPersistence.locate(session.header)` 解析（纯路径计算，活会话可用；返回 `{kind:"jsonl", path:<session.jsonl.zstd 绝对路径>}`，取 dirname）。**⚠️ `locate` 不是公开 API**：`SessionPersistence` 公开面只有 `create/open/flush/stat/list`，`stat()` 的 `SessionPersistenceSnapshot` **不含任何路径**；`locate` 只是 JSONL 后端类上的 `private` 方法（TS 的 `private` 运行时被擦除，所以今天能用）。上游改名/移除即失效——因此 v1.6.0 起降级路径会经 `_warnOnce()` 打到宿主日志（`ctx.logger`，回退 `console.warn`），**不要改回静默降级**：静默时"审计随会话保存"的承诺会悄悄失效而没人知道。降级文件在 `<DSH_HOME>/agent-approval/records/<sessionId>.jsonl`（重启仍安全，但删会话不随删）。语义上仍是"跟随会话保存"：随会话目录存在，删除会话即消失。
 - **绝不要把审计写进会话事件日志（v1.5.0 的方案，半天即废弃）**。踩坑全过程：`dsh-session` 的 `append()` 运行时不校验事件类型枚举，`dsh-session-persistence-jsonl` 也按原样回放——但 **`dsh-session-persistence` seam 在加载时强制校验**：`KNOWN_SESSION_EVENT_TYPES` 之外的类型，事件信封必须带 `ignorable: true`，否则**整个日志拒绝加载**（"refusing to interpret"）。而活会话的写入口 `session.append(type, data)` 只接受 type/data/surface 元数据，**给不了 ignorable 标记**（类型签名也限死 `SessionEventType`）——所以一条审批记录就会让该会话永远无法恢复。另外日志压实（compaction）也可能丢弃 ignorable 外部事件。
 - **"v1.5.0 零写入"的旧结论是假的，2026-09-06 已证伪并修复**。旧版 `check-session-log.mjs` 用朴素 magic 扫描切帧且带占位符 bug，只解出部分帧就报"零写入"——实际 session-886106a4 的日志里有 **3 条**未标 ignorable 的 `agent-approval/record`（seq 52022/117810/140809），会话历史加载被拒。注意官方机制本就给插件事件留了正门：`dsh-session` 的 `known-event-types.js` 明说 **`ignorable` 标记就是 repo 外插件事件的兼容机制**（只是 `session.append` 的活写入路径给不了它）。修复用 `scripts/repair-session-log.mjs`：按 `scanZstdFrames` 的结构化走帧（逐 block header 前进，不靠帧头 content size），**只给 3 个事件的信封补 `"ignorable":true` 并重压所在帧，其余帧字节不动**——绝不能删行，扫描器强制 seq 连续（`event.seq !== events.length` 即 seq gap）。写前快照 mtime/size 防并发写、写前备份、写后全帧解码验证。校验/扫描用重写后的 `check-session-log.mjs`（可 `import { auditLog }` 库用；注意 `text-chunks`/`reasoning-chunks`/`tool-call-chunks` 是存储行、`type:"session"` 是头记录，都不进事件类型校验；`zstdDecompressSync`/`createZstdDecompress` 对多帧拼接文件只会解出第一帧，必须逐帧解）。全库 194 个日志复扫，仅此一个会话中毒。seq 140809 写于 12:27:59（"重启"之后）——说明当时仍有旧构建的 Host 半在写日志；现装 v1.5.1 已验证只剩 `permission/preset`/`sandbox/mode` 两种已知类型的 `session.append`。
+- **事件词表三级解析（2026-09-11 修正，词表已漂移过一次）**：`check-session-log.mjs` 的 `KNOWN_SESSION_EVENT_TYPES` 按权威度依次尝试 ① 裸导入 `@deepseek-ai/dsh-session`（`link:` 安装的插件解析不到，通常失败）；② **DSH profile 里那份真源码的绝对路径**（`$DSH_HOME/profiles/*/node_modules/@deepseek-ai/dsh-session/lib/types/known-event-types.js`，本机实际生效的就是这一份）；③ 包内快照。CLI 会打印实际用的是哪一份。**快照必须随 DSH 升级重新同步**：0.1.3-alpha.2 → 0.1.5-rc.1 时它已经错过一次——`tool/code-dispatch`/`tool/code-dispatch-start` 被改名为 `tool/ptc-dispatch`/`tool/ptc-dispatch-start`，并新增了 `deliverables/presented`、`subagent/catalog`、`system/message`；旧快照会把**现有日志误报成"拒绝加载"**（假警）同时把已改名的类型当成已知（漏警）。②的存在就是为了让升级后自动跟上，但快照仍是最后一道防线，升级后请人工核对一次。
 - **最终裁定（2026-09-06，用户明确）**：zstd 会话日志里**不存、不读任何插件自定义数据**。v1.5.2 起 `sessionRecords` **只读旁路文件**（v1.5.1 的"防御性日志折叠"已删除，`RECORD_EVENT` 常量一并移除）。日志中遗留的 3 条 ignorable record 事件（seq 52022/117810/140809）为惰性历史，加载已验证安全；**物理删除不可行**——删行会破坏 seq 连续性（扫描器以 `event.seq !== events.length` 判 gap），修复需全日志重编号，风险远大于收益，不要尝试。
 - 读取：Host `sessionRecords({ sessionId })` **只读旁路文件**（`_recordsFileOf`），按 `at` 正序返回，同时带 `enabled`（该会话当前是否开启）。Client「审批」tab 挂载 + 每 10s 轮询（tab 未激活时不渲染、不轮询）。
 - 每条：时间、会话、工具、结论、风险等级、审批模型、耗时、理由（截断 600）、**工具参数**（v1.6.0 起 `evidenceText` 头+尾渲染、预算 2000；`…[N chars omitted]…` 表示该记录的参数不完整，「加白」按钮对这类记录直接不出现）、`childSessionId`（审批 Agent 自己的会话短 id——在会话列表里能找到完整推理记录）。
@@ -201,7 +202,7 @@ npm run patch:glyph      # 可选：权限菜单图标（幂等）
 
 > `npm test` 用 `node --test test/`，它**会为每个测试文件 spawn 子进程**。在带严格沙箱的环境里（子进程管道 stdio 被禁）会报 `EPERM`，此时用 `node --test --test-isolation=none "test/**/*.test.mjs"` 在单进程内跑——这是环境限制，不是测试失败。
 
-改插件后**必须重启 DSH 进程**才生效。验证：
+改插件后**必须重启 DSH 进程**才生效。**手工验证清单（⚠️ 截至 2026-09-11 在本机一次都没执行过——本机 profile 未安装本插件；状态见下方"宿主版本与验证状态"）**：
 1. 输入框 `/permission` 菜单出现第四项 **Agent 审批**；设置 → 侧栏导航出现 **Agent 审批** 页（模型/超时可保存）。
 2. 用 `/agent-approval on` 或菜单选 **Agent 审批** 为会话开启（两条路径等价）；输入框左侧**不再有**「🛡 审批」chip。
 3. 开启后让工作区内命令触发一次提权重试（`sandbox_permissions`）：**不弹人工审批**，片刻后工具结果即为批准/拒绝；会话窗口顶部出现**「审批」标签页**（轨迹旁），点开能看到这条记录（含风险等级与理由；10s 内自动刷新，也可手动点「刷新」）。
@@ -211,6 +212,32 @@ npm run patch:glyph      # 可选：权限菜单图标（幂等）
 7. 设置页加一条 allow 规则（如工具 `pwsh` + match 子串）→ 命中的提权**不再起审批子代理**，审计 model 列显示 `rule`；模型批准的提权在同一会话内以完全相同参数再次发起 → 直接放行，model 列显示 `trust`；「审批」tab 审计行点「加白」→ 规则表新增对应 allow 规则。
 8. **全量放行被拒（v1.6.0）**：设置页填 `effect=放行`、`tool=*`、`match` 留空（或只填空格）→ 保存应报错 `invalid-rule`（同样的形状选「拒绝」则允许）。
 9. **委派子会话不被自动开启，用户 fork 仍会被自动开启（v1.6.0，两者别搞混）**：由 subagent 委派产生的 fork 子会话（`header.origin === "subagent"`）在重启后审批策略应仍是 `never`（日志里最后一次 `approval/policy` 仍是 `source: "delegation"`），不会出现插件写的 `ask`；而**用户在侧栏 fork 出来的会话**（只有 `parentSession`、没有 origin）继承 seed 里的 `agent-approval` preset 后，必须照旧被 `agent/created` 自动开启（否则菜单显示已选中、实际不裁决）。
+
+## 宿主版本与验证状态（2026-09-11 起，先读）
+
+本机环境：DSH profile 只有 **`desktop`**（**没有** `web`），宿主 **0.1.5-rc.1**，cordis **4.0.2**，zod **4.5.4**；`0.1.3-alpha.2` 的 tarball 已随本次升级从 `desktop-packages/` 删除。下面这份"某行为是否可用"的结论，权威来源永远是 `~/.dsh/profiles/desktop/node_modules/@deepseek-ai/*/lib/*.js` 的真源码，不是本文档。
+
+**⚠️ 本插件至今从未在真实 DSH 里加载运行过。** 本机 profile 没装它，下面所有结论都来自**离线**检查；写提交信息/文档/PR 时不要声称做过运行时验证。
+
+| 已做（可复现） | 结论 |
+|---|---|
+| `npm run check` | 全部 `.js` / `.mjs` 语法通过 |
+| `node --test --test-isolation=none "test/**/*.test.mjs"` | **24/24** 通过 |
+| 离线集成检查（跑真业务代码 + typert-loader 校验规则 + strict wire schema `.parse()`） | **120/120** 通过 |
+| `scripts/check-session-log.mjs` 打真实会话日志 | 正常（词表解析到 profile 内真源码） |
+| **0.1.3-alpha.2 → 0.1.5-rc.1 静态漂移审计**（逐条对照安装版源码） | 插件依赖的宿主 API **全部仍在、形状兼容** |
+| 真实 DSH 加载 / 端到端审批 / 浏览器 UI / release workflow | **未验证** |
+
+**漂移审计覆盖的宿主面**（下列每一条都在 0.1.5-rc.1 安装版源码里核对过，升级后仍然成立）：
+
+- 审批：`approval/request` 以 `scopeTarget(req.agent, req.agent)` 派发（**untagged 监听器一律放行**，`hook.global || !filter || filter(...)`），`OUTCOMES` 仍是四元组、`allowed-once` 仍是唯一授权值；`overrideOf(session)` / `config.policy` / `setPolicy(agent, policy)` 均在；`never` 仍在瀑布之前短路为 `rejected`。
+- 会话：`snapshotEvents(from, to)` / `append(type, data)` / `header` 均在；`validateSessionHeader` 里 **`origin` 仍只允许 `"subagent"`**、`parentSession` 仍可单独存在（这正是用户 fork 的判据基础，见 8.5）；`session/event`、`agent/created`（载荷 `{agent}`）、`session/disposed`（参数 `[session]`）、`agents.get(id)` 形状不变。
+- 权限表：基础组合的 `- id: permission` 行**未改名**（`@deepseek-ai/dsh-permission-presets`），Config 字段仍是 `sandbox`/`approval`/`name`/`description`，`SANDBOX_MODES` 仍含 `read-only`——所以包内 `cordis.patch.yml` 的整表覆盖照旧合法。
+- 子代理：`subagents.start("spawn", …)` 仍接受 `outputSchema`/`toolFilter`/`persona`/`agentOptions`，`assertObjectJsonSchema` 仍在；返回 `{id, result, dispose}`，`result.{structured, stopReason}`；干净跑完但没有结构化捕获时 stopReason 被**强制成 `error`**。
+- 可选面：`sessionPersistence.locate(meta)` 仍在 JSONL 后端原型上（**依然不是公开 API**）；`sessionTitle.get`、`agentDefaultModel.currentSelection`、`llm.listProviders/listModels`、`systemPrompt.context({name,order,text})`、`commands.register`（invocation 有 `rawInput`/`agent`）全部在位。
+- Typert / Client：manifest 校验规则（`package`/`face`/`schemas`/`model.services|events|objects`/`invocations` + strict codec `{mode:"strict",typeSymbol,schema}`）不变，本包 manifest 逐条合规；`./typert` 导出、`window.__ModuleLoader__`、`ctx.remote.$mount`、`dsh.client.platform` 均在；`conversation.view` 仍是 chat=0 / trajectory=10、tab 栏条件仍是 `tabs.length > 1`；官方 `permissionGlyphs` 仍**不含** `agent-approval`（所以内置 MutationObserver 方案仍必需），`_itemIcon_` 类名仍在。
+
+**重跑离线集成检查**（需要宿主包，跑完务必清理 `node_modules`，见第 9 节）：装 `cordis 4.0.2` + `dsh-typert-protocol 0.1.5-rc.1` + `zod 4.5.4`，**并且必须补 `@deepseek-ai/cosmokit`**（cordis 直接 import 它，缺了连 `import("@deepseek-ai/cordis")` 都 ERR_MODULE_NOT_FOUND）。两个坑：① **npm 11 会静默跳过** 以本地 tarball 路径给出的包（`added 1 package` 却什么都没装），用 `tar -xzf <tarball>` 直接解到 `node_modules/@deepseek-ai/<name>/` 最可靠；② 构造服务**不要用 `new Svc(ctx, {})`**（cordis `Service` 基类要真 Context，报 `Cannot read properties of undefined (reading 'provide')`），用 `Object.create(Svc.prototype)` + 手工填 `_rules`/`_trusted`/`_enabled`/`_warned`/`_model`/`_timeoutMs` 并把 `_persistConfig` 打成桩——这样跑的是真业务代码。**注意**：桩掉 `_record` 后就测不到真实审计写入，想测真 `_record` 要 `delete s._record` 让原型方法生效。
 
 ## 发布
 

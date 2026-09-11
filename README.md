@@ -66,7 +66,7 @@ dsh plugin --profile web add /path/to/dsh-agent-approval
 dsh plugin --profile web add https://github.com/MoonlitDropOfBlood/dsh-agent-approval/releases/download/v1.6.0/dsh-agent-approval-1.6.0.tgz
 ```
 
-> 本地路径安装前**务必先 `npm install`**：缺 `node_modules` 时启动会 `ERR_MODULE_NOT_FOUND`，整个 DSH 起不来。宿主包版本要跟本机 DSH 对齐（避免双副本漂移），详见 [AGENTS.md](AGENTS.md) 第 9 节。
+> 本地路径安装前**务必先 `npm install`**：缺 `node_modules` 时启动会 `ERR_MODULE_NOT_FOUND`，整个 DSH 起不来。宿主包版本要跟本机 DSH 对齐（避免双副本漂移），详见 [AGENTS.md](AGENTS.md) 第 9 节。`--profile` 填你实际的 profile 名（官方 Web 端是 `web`，桌面端是 `desktop`）。
 
 重启 DSH 后：设置面板出现 **Agent 审批** 页；`/permission` 菜单出现第四项 **Agent 审批**。
 
@@ -97,7 +97,7 @@ dsh plugin --profile web add https://github.com/MoonlitDropOfBlood/dsh-agent-app
 - **不允许"全量放行"规则**：`放行 + tool=* + match 留空（或纯空白）` 等于一键关掉整个审批控制，`addRule` 直接拒绝（`拒绝` 的同形状仍然允许；手工编辑 `config.json` 仍会被加载）。规则表与审批模型是**全局的**（不区分 workspace / 会话），规则增删也不进审计——加规则时请意识到它影响所有开启本模式的会话。
 - **审计存储依赖一个非公开 hook**：会话目录定位走 `sessionPersistence.locate()`（不在 DSH 公开 API 里）。一旦上游移除它，记录会退回 `<DSH_HOME>/agent-approval/records/`（不再随会话删除），**并在宿主日志打印告警**——这是有意设计，避免"审计看似正常其实已脱离会话"。
 - **Remote 面按可信客户端对待**：`toggle` / `sessionRecords` / `addRule` / `setModel` 都没有调用方归属校验。今天的 Web 客户端与人工审批者同属一个信任域（能弹窗批准的人本来就能放行一切），所以不构成提权；但不要把本插件的 gateway 暴露到跨信任域的场景。
-- **委派子会话不会被自动开启**：DSH 把子代理审批策略钉死为 `never`（子代理拿不到父级没给的权限）。插件在自动重新开启时会跳过 `origin: "subagent"` / 有 `parentSession` 的会话，避免覆盖这条钉死；用户在活着的子会话里**显式**选预设仍然生效。
+- **委派子会话不会被自动开启，用户自己的 fork 会**：DSH 把子代理审批策略钉死为 `never`（子代理拿不到父级没给的权限）。插件只对**委派产生**的子会话跳过自动开启——判据**只有** `header.origin === "subagent"`；**绝不能用 `parentSession` 当判据**，因为你在侧栏 fork 出来的会话只写 `parentSession`、不写 `origin`，用它会让你自己的 fork 继承预设后**永不生效**（菜单显示已选中、实际不裁决）。用户在活着的子会话里**显式**选预设同样生效。
 
 ## 目录结构
 
@@ -126,6 +126,8 @@ npm run patch:glyph     # 可选：权限菜单图标
 ```
 
 详见 [AGENTS.md](AGENTS.md)——记录了 DSH 正式插件（Host/Client/Typert 三件套）的完整机制、审批瀑布 prepend 抢占与结构化子代理裁决的踩坑。
+
+> **验证状态（请勿误读）**：以上命令全部做过，`lib/pure.js` 单测 24/24、离线集成检查 120/120 通过；Host 侧依赖的 DSH API 也逐条对照 **DSH 0.1.5-rc.1** 的安装版源码核对过（无破坏性漂移）。但**本插件至今没有在真实 DSH 里加载运行过**——没有装进任何 profile，因此 `/permission` 菜单、审计标签页、端到端审批链路、浏览器 UI 与 release workflow **均未验证**。详见 [AGENTS.md](AGENTS.md) 的「宿主版本与验证状态」。
 
 ## License
 
